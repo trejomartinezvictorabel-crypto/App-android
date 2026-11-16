@@ -1,5 +1,4 @@
-name: Compilar APK Android 16
-
+name: Compilar APK Android
 on:
   push:
     branches: [ main, master ]
@@ -8,7 +7,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
     - name: Copiar repositorio
       uses: actions/checkout@v4
@@ -19,17 +17,13 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Dar permisos de ejecución a Gradle
-      run: chmod +x gradlew || echo "No gradlew found yet"
-
-    - name: Compilar APK de depuración (Debug)
+    - name: Inicializar Gradle Wrapper
       run: |
-        if [ -f "gradlew" ]; then
-          ./gradlew assembleDebug
-        else
-          echo "Falta el archivo gradlew en el repositorio"
-          exit 1
-        fi
+        gradle wrapper --gradle-version 8.5
+        chmod +x gradlew
+
+    - name: Compilar APK de depuración
+      run: ./gradlew assembleDebug
 
     - name: Subir APK generado
       uses: actions/upload-artifact@v4
