@@ -19,44 +19,56 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
       - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
-      - name: Configurar Gradle y Permisos Correctamente
+      
+      - name: Parchear Gradle y AndroidManifest con Python
         run: |
           python3 -c "
-          # 1. Modificar android/app/build.gradle con la sintaxis correcta para Gradle moderno
+          import os
+
+          # 1. Modificar android/app/build.gradle de manera directa y segura
           gradle_path = 'android/app/build.gradle'
-          with open(gradle_path, 'r') as f:
-              content = f.read()
+          if os.path.exists(gradle_path):
+              with open(gradle_path, 'r') as f:
+                  content = f.read()
+              
+              # Reemplazos exactos para forzar SDK 36 y MinSDK 24
+              content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 36')
+              content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 36')
+              content = content.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 24')
+              content = content.replace('minSdkVersion flutterMinSdkVersion.toInteger()', 'minSdkVersion 24')
+              
+              # Por si usa bloques tradicionales
+              if 'minSdkVersion 21' in content:
+                  content = content.replace('minSdkVersion 21', 'minSdkVersion 24')
+              if 'compileSdkVersion 35' in content:
+                  content = content.replace('compileSdkVersion 35', 'compileSdkVersion 36')
+              if 'targetSdkVersion 35' in content:
+                  content = content.replace('targetSdkVersion 35', 'targetSdkVersion 36')
 
-          # Reemplazar las versiones usando la sintaxis de enteros estándar de Gradle
-          content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 36')
-          content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 36')
-          content = content.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 24')
-          content = content.replace('minSdkVersion flutterMinSdkVersion.toInteger()', 'minSdkVersion 24')
-          
-          # Si usa flutter.compileSdkVersion como variable numérica en android { ... }
-          content = content.replace('flutter.compileSdkVersion.toInteger()', '36')
-          content = content.replace('flutter.targetSdkVersion.toInteger()', '36')
-          content = content.replace('flutter.minSdkVersion.toInteger()', '24')
-
-          with open(gradle_path, 'w') as f:
-              f.write(content)
+              with open(gradle_path, 'w') as f:
+                  f.write(content)
+              print('build.gradle actualizado correctamente.')
 
           # 2. Agregar permisos en AndroidManifest.xml
           manifest_path = 'android/app/src/main/AndroidManifest.xml'
-          with open(manifest_path, 'r') as f:
-              manifest = f.read()
-          permisos = '''
-              <uses-permission android:name=\"android.permission.INTERNET\"/>
-              <uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>
-              <uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>
-              <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>
-              <uses-permission android:name=\"android.permission.WAKE_LOCK\"/>
-          '''
-          if '<application' in manifest and 'ACCESS_FINE_LOCATION' not in manifest:
-              manifest = manifest.replace('<application', permisos + '\n    <application')
-              with open(manifest_path, 'w') as f:
-                  f.write(manifest)
+          if os.path.exists(manifest_path):
+              with open(manifest_path, 'r') as f:
+                  manifest = f.read()
+              
+              permisos = '''
+                  <uses-permission android:name=\"android.permission.INTERNET\"/>
+                  <uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>
+                  <uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>
+                  <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>
+                  <uses-permission android:name=\"android.permission.WAKE_LOCK\"/>
+              '''
+              if '<application' in manifest and 'ACCESS_FINE_LOCATION' not in manifest:
+                  manifest = manifest.replace('<application', permisos + '\n    <application')
+                  with open(manifest_path, 'w') as f:
+                      f.write(manifest)
+                  print('AndroidManifest.xml actualizado con permisos.')
           "
+
       - run: flutter pub get
       - run: flutter build apk --debug
       - uses: actions/upload-artifact@v4
