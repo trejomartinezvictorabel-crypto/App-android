@@ -1,33 +1,37 @@
-name: Compilar APK Android
+name: Build Android APK
+
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - name: Copiar repositorio
-      uses: actions/checkout@v4
-
-    - name: Configurar JDK 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
-
-    - name: Inicializar Gradle Wrapper
-      run: |
-        gradle wrapper --gradle-version 8.5
-        chmod +x gradlew
-
-    - name: Compilar APK de depuración
-      run: ./gradlew assembleDebug
-
-    - name: Subir APK generado
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-debug
-        path: app/build/outputs/apk/debug/app-debug.apk
-  
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.0'
+          cache: true
+      - run: flutter create . --org com.albanil.app --project-name app_obra_pro --platforms=android
+      - name: Ajustar SDK 35 con Python
+        run: |
+          python3 -c "
+          path = 'android/app/build.gradle'
+          with open(path, 'r') as f:
+              content = f.read()
+          content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 35')
+          content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 35')
+          with open(path, 'w') as f:
+              f.write(content)
+          "
+      - run: flutter pub get
+      - run: flutter build apk --debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-albanileria-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
