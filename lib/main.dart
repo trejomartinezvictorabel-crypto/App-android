@@ -16,6 +16,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_compass/flutter_compass.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:geolocator/geolocator.dart';
@@ -989,6 +990,14 @@ class ProveedorMbTiles extends TileProvider {
 // 8. CONTROLADOR (equivalente al ViewModel): estado + lógica de navegación
 // ============================================================================
 
+/// Mapa .mbtiles disponible: en el almacenamiento propio de la app o en la carpeta pública Descargas.
+class MapaLocal {
+  final String nombre;
+  final String ruta;
+  final bool enDescargas;
+  const MapaLocal(this.nombre, this.ruta, this.enDescargas);
+}
+
 enum Fase { inactiva, navegando, llegada }
 
 class Controlador extends ChangeNotifier {
@@ -1016,7 +1025,11 @@ class Controlador extends ChangeNotifier {
   bool escuchando = false;
   bool redCargada = false;
   String redEstado = 'Sin red vial: se usa ruta en línea recta';
-  List<String> mapas = [];
+  List<MapaLocal> mapas = [];
+  // Brújula: ValueNotifier aparte para redibujar SOLO el widget de la brújula (no toda la pantalla)
+  final ValueNotifier<double?> brujula = ValueNotifier<double?>(null);
+  bool brujulaDisponible = true;
+  bool rumboArriba = false; // true = el mapa gira para que "arriba" sea hacia donde apunta el teléfono
   int versionMapas = 0;
   String? mensaje;
   List<Poi> pois = [];
@@ -1033,6 +1046,8 @@ class Controlador extends ChangeNotifier {
   int? _histId;
   String? _ultimaInstr;
   bool _gpsConNotificacion = false;
+  StreamSubscription<CompassEvent>? _subBrujula;
+  double? _rumboSuave;
 
   void _msg(String t) {
     mensaje = t;
@@ -1047,6 +1062,7 @@ class Controlador extends ChangeNotifier {
     await _abrirMapas();
     await _cargarRedGuardada();
     await iniciarGps();
+    _iniciarBrujula();
   }
 
   Future<void> _recargar() async {
@@ -1057,9 +1073,16 @@ class Controlador extends ChangeNotifier {
   }
 
   // ------------------------------------------------------------------ GPS
-  Future<void> alMostrar() => iniciarGps();
+  Future<void> alMostrar() async {
+    await iniciarGps();
+    _iniciarBrujula();
+    // Si no había mapas, se vuelve a buscar (quizá acabas de copiar el .mbtiles a Descargas
+    // o de conceder «Acceso a todos los archivos»).
+    if (mapas.isEmpty) await _abrirMapas();
+  }
 
   Future<void> alOcultar() async {
+    _detenerBrujula(); // el sensor magnético solo se usa con la app visible (ahorra batería)
     await stt.cancelar();
     escuchando = false;
     if (fase != Fase.navegando) await _detenerGps();
@@ -1453,33 +1476,155 @@ class Controlador extends ChangeNotifier {
     }
   }
 
+  // ---------------------------------------------------- brújula
+  void _iniciarBrujula() {
+    if (_subBrujula != null) return;
+    final flujo = FlutterCompass.events; // null si el teléfono no tiene magnetómetro
+    if (flujo == null) {
+      brujulaDisponible = false;
+      notifyListeners();
+      return;
+    }
+    brujulaDisponible = true;
+    _subBrujula = flujo.listen((e) {
+      final h = e.heading;
+      if (h == null) return;
+      final nuevo = (h + 360.0) % 360.0;
+      final previo = _rumboSuave;
+      if (previo == null) {
+        _rumboSuave = nuevo;
+        brujula.value = nuevo;
+        return;
+      }
+      final d = ((nuevo - previo + 540.0) % 360.0) - 180.0; // diferencia con el salto 359°→0° resuelto
+      if (d.abs() < 1.0) return; // ignora el ruido del sensor
+      final suave = (previo + d * 0.3 + 360.0) % 360.0; // filtro pasa-bajas: aguja estable
+      _rumboSuave = suave;
+      brujula.value = suave;
+    }, onError: (Object _) {});
+  }
+
+  void _detenerBrujula() {
+    _subBrujula?.cancel();
+    _subBrujula = null;
+  }
+
+  void alternarRumboArriba() {
+    rumboArriba = !rumboArriba;
+    _msg(rumboArriba ? 'Mapa con rumbo arriba (gira con la brújula).' : 'Mapa con el norte arriba.');
+  }
+
   // ---------------------------------------------------- mapas y red vial
   Future<Directory> _carpeta(String nombre) async {
     final base = await getApplicationDocumentsDirectory();
     return Directory(ruta_p.join(base.path, nombre)).create(recursive: true);
   }
 
+  // ---- Carpeta pública Descargas ----
+  /// Rutas candidatas de Descargas (la física se llama «Download» aunque el teléfono esté en español).
+  Future<List<String>> _carpetasDescargas() async {
+    final r = <String>['/storage/emulated/0/Download'];
+    try {
+      final ext = await getExternalStorageDirectory(); // .../Android/data/<paquete>/files
+      if (ext != null) {
+        final i = ext.path.indexOf('/Android');
+        if (i > 0) r.insert(0, '${ext.path.substring(0, i)}/Download');
+      }
+    } catch (_) {}
+    return r.toSet().toList();
+  }
+
+  /// En Android 11+ leer archivos que no son de la app exige «Acceso a todos los archivos»
+  /// (MANAGE_EXTERNAL_STORAGE); en Android 10 o menor basta el permiso de almacenamiento.
+  Future<bool> _tienePermisoDescargas() async =>
+      await Permission.manageExternalStorage.isGranted || await Permission.storage.isGranted;
+
+  Future<bool> _pedirPermisoDescargas() async {
+    if (await _tienePermisoDescargas()) return true;
+    // Android 11+: abre la pantalla de Ajustes «Acceso a todos los archivos» para esta app
+    if ((await Permission.manageExternalStorage.request()).isGranted) return true;
+    // Android 10 o menor: diálogo normal de almacenamiento
+    return (await Permission.storage.request()).isGranted;
+  }
+
+  Future<List<File>> _mbtilesEnDescargas() async {
+    for (final ruta in await _carpetasDescargas()) {
+      final dir = Directory(ruta);
+      try {
+        if (!await dir.exists()) continue;
+        final archivos = <File>[];
+        await for (final e in dir.list(followLinks: false)) {
+          if (e is File && e.path.toLowerCase().endsWith('.mbtiles')) archivos.add(e);
+        }
+        return archivos;
+      } on FileSystemException {
+        continue; // sin permiso sobre esta ruta
+      }
+    }
+    return <File>[];
+  }
+
+  /// Abre los .mbtiles de Descargas (si hay permiso) y los importados al almacenamiento propio.
+  /// Los de Descargas se leen EN SITIO: no se copian ni se duplica el espacio.
   Future<void> _abrirMapas() async {
     for (final d in _basesMb) {
       await d.close();
     }
     _basesMb.clear();
-    final carpeta = await _carpeta('mapas');
-    final archivos = carpeta
-        .listSync()
-        .whereType<File>()
-        .where((f) => f.path.toLowerCase().endsWith('.mbtiles'))
-        .toList()
-      ..sort((a, b) => a.path.compareTo(b.path));
-    for (final f in archivos) {
+
+    final candidatos = <MapaLocal>[];
+    final propia = await _carpeta('mapas');
+    for (final f in propia.listSync().whereType<File>()) {
+      if (f.path.toLowerCase().endsWith('.mbtiles')) {
+        candidatos.add(MapaLocal(ruta_p.basename(f.path), f.path, false));
+      }
+    }
+    if (await _tienePermisoDescargas()) {
       try {
-        _basesMb.add(await openDatabase(f.path, readOnly: true, singleInstance: false));
+        for (final f in await _mbtilesEnDescargas()) {
+          candidatos.add(MapaLocal(ruta_p.basename(f.path), f.path, true));
+        }
       } catch (_) {}
     }
-    mapas = archivos.map((f) => ruta_p.basename(f.path)).toList();
+    candidatos.sort((a, b) => a.nombre.compareTo(b.nombre));
+
+    final validos = <MapaLocal>[];
+    final invalidos = <String>[];
+    final vistos = <String>{};
+    for (final m in candidatos) {
+      if (!vistos.add(m.nombre)) continue; // mismo nombre en Descargas y en la app: se usa uno
+      Database? db;
+      try {
+        db = await openDatabase(m.ruta, readOnly: true, singleInstance: false);
+        await db.rawQuery('SELECT 1 FROM tiles LIMIT 1'); // comprueba que sea un MBTiles real
+        _basesMb.add(db);
+        validos.add(m);
+      } catch (_) {
+        await db?.close();
+        invalidos.add(m.nombre);
+      }
+    }
+    mapas = validos;
     proveedorTiles = ProveedorMbTiles(List<Database>.of(_basesMb));
     versionMapas++;
     notifyListeners();
+    if (invalidos.isNotEmpty) {
+      _msg('No se pudo abrir como MBTiles: ${invalidos.join(', ')}');
+    }
+  }
+
+  /// Botón «Buscar en Descargas»: pide el permiso si falta y vuelve a leer la carpeta.
+  Future<void> buscarEnDescargas() async {
+    if (!await _pedirPermisoDescargas()) {
+      _msg('Sin el permiso «Acceso a todos los archivos» no puedo leer la carpeta Descargas.');
+      return;
+    }
+    await _abrirMapas();
+    if (mapas.any((m) => m.enDescargas)) {
+      _msg('Mapas cargados desde Descargas.');
+    } else {
+      _msg('No encontré archivos .mbtiles en la carpeta Descargas.');
+    }
   }
 
   Future<void> importarMapa() async {
@@ -1500,13 +1645,15 @@ class Controlador extends ChangeNotifier {
     }
   }
 
-  Future<void> eliminarMapa(String nombre) async {
-    final carpeta = await _carpeta('mapas');
-    final f = File(ruta_p.join(carpeta.path, nombre));
+  Future<void> eliminarMapa(MapaLocal m) async {
+    if (m.enDescargas) {
+      return _msg('Ese mapa está en Descargas: bórralo desde tu administrador de archivos.');
+    }
     for (final d in _basesMb) {
       await d.close();
     }
     _basesMb.clear();
+    final f = File(m.ruta);
     if (await f.exists()) await f.delete();
     await _abrirMapas();
   }
@@ -1558,6 +1705,8 @@ class Controlador extends ChangeNotifier {
   @override
   void dispose() {
     _sub?.cancel();
+    _subBrujula?.cancel();
+    brujula.dispose();
     stt.cancelar();
     WakelockPlus.disable();
     super.dispose();
@@ -1570,6 +1719,8 @@ class Controlador extends ChangeNotifier {
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Vertical fija: la brújula del sensor está calibrada para el teléfono en vertical
+  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   final c = Controlador();
   runApp(AppNavegacion(c));
   c.iniciar(); // abre BD, voz, mapas, red vial y GPS sin bloquear el primer frame
@@ -1613,11 +1764,13 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     c.addListener(_alCambiar);
+    c.brujula.addListener(_alBrujula);
   }
 
   @override
   void dispose() {
     c.removeListener(_alCambiar);
+    c.brujula.removeListener(_alBrujula);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -1629,6 +1782,33 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
       c.alMostrar();
     } else if (estado == AppLifecycleState.paused) {
       c.alOcultar();
+    }
+  }
+
+  int _ultimoGiroMs = 0;
+  double _ultimoGiro = 0;
+
+  /// Modo «rumbo arriba»: gira el mapa con la brújula (máx. ~10 veces/s y solo si cambia >2°).
+  void _alBrujula() {
+    if (!mounted || !c.rumboArriba || !_listo) return;
+    final h = c.brujula.value;
+    if (h == null) return;
+    final ahora = DateTime.now().millisecondsSinceEpoch;
+    if (ahora - _ultimoGiroMs < 100 || Geo.difAng(_ultimoGiro, h).abs() < 2.0) return;
+    _ultimoGiroMs = ahora;
+    _ultimoGiro = h;
+    _mapa.rotate(-h);
+  }
+
+  void _alPulsarBrujula() {
+    c.alternarRumboArriba();
+    if (!_listo) return;
+    final h = c.brujula.value;
+    if (c.rumboArriba && h != null) {
+      _ultimoGiro = h;
+      _mapa.rotate(-h);
+    } else {
+      _mapa.rotate(0);
     }
   }
 
@@ -1693,15 +1873,22 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                   if (c.permisoOk && !c.gpsActivo)
                     _aviso('El GPS está apagado.', 'Activar', Geolocator.openLocationSettings),
                   if (c.mapas.isEmpty)
-                    _aviso('Sin mapas offline. Importa un archivo .mbtiles (raster).', 'Importar', c.importarMapa),
+                    _aviso('Sin mapas offline. Copia tu .mbtiles a la carpeta Descargas.', 'Buscar', c.buscarEnDescargas),
                   if (c.fase == Fase.navegando) _banner(esc),
                 ]),
               ),
             ),
             Positioned(
               right: 8,
-              top: MediaQuery.of(context).size.height * 0.33,
+              top: MediaQuery.of(context).size.height * 0.26,
               child: Column(children: [
+                Brujula(
+                  rumbo: c.brujula,
+                  disponible: c.brujulaDisponible,
+                  rumboArriba: c.rumboArriba,
+                  alPulsar: _alPulsarBrujula,
+                ),
+                const SizedBox(height: 8),
                 _botonRedondo(Icons.my_location, _seguir, () {
                   setState(() => _seguir = !_seguir);
                   final u = c.ubic;
@@ -1749,7 +1936,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         ),
         if (r != null)
           PolylineLayer(polylines: [Polyline(points: r.puntos, strokeWidth: 6, color: Colors.blue.shade700)]),
-        MarkerLayer(markers: [
+        MarkerLayer(rotate: true, markers: [  // rotate: los pines no se giran con el mapa
           for (final p in c.pois)
             Marker(
               point: LatLng(p.lat, p.lon),
@@ -2091,15 +2278,21 @@ class PantallaMenu extends StatelessWidget {
         onChanged: c.establecerVoz,
       ),
       const Divider(),
-      const Text('Mapas offline instalados (.mbtiles raster)', style: TextStyle(fontWeight: FontWeight.bold)),
-      if (c.mapas.isEmpty) const Text('No hay mapas instalados.'),
+      const Text('Mapas offline (.mbtiles raster)', style: TextStyle(fontWeight: FontWeight.bold)),
+      if (c.mapas.isEmpty) const Text('No hay mapas. Copia el .mbtiles a la carpeta Descargas y pulsa «Buscar en Descargas».'),
       for (final m in c.mapas)
         ListTile(
           contentPadding: EdgeInsets.zero,
-          title: Text(m, maxLines: 1, overflow: TextOverflow.ellipsis),
-          trailing: IconButton(onPressed: () => c.eliminarMapa(m), icon: const Icon(Icons.delete_outline)),
+          leading: Icon(m.enDescargas ? Icons.download_done : Icons.folder),
+          title: Text(m.nombre, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text(m.enDescargas ? 'Leído desde Descargas' : 'Importado a la app'),
+          trailing: m.enDescargas
+              ? null
+              : IconButton(onPressed: () => c.eliminarMapa(m), icon: const Icon(Icons.delete_outline)),
         ),
-      FilledButton(onPressed: c.importarMapa, child: const Text('Importar mapa (.mbtiles)')),
+      FilledButton(onPressed: c.buscarEnDescargas, child: const Text('Buscar en Descargas')),
+      const SizedBox(height: 8),
+      OutlinedButton(onPressed: c.importarMapa, child: const Text('Elegir y copiar un .mbtiles…')),
       const Divider(),
       const Text('Red vial para enrutamiento', style: TextStyle(fontWeight: FontWeight.bold)),
       Text(c.redEstado),
@@ -2181,4 +2374,116 @@ Future<void> dialogoRuta(BuildContext context, Controlador c) async {
     ),
   );
   nombre.dispose();
+}
+
+
+// ============================================================================
+// 12. BRÚJULA (flutter_compass)
+// ============================================================================
+
+/// Brújula circular: el disco gira en sentido contrario al rumbo del teléfono, de modo que la «N»
+/// siempre señala el norte; el triángulo fijo de arriba marca hacia dónde apunta el teléfono.
+/// Toque = alternar «norte arriba» / «rumbo arriba» (el mapa gira con la brújula).
+class Brujula extends StatelessWidget {
+  final ValueListenable<double?> rumbo;
+  final bool disponible;
+  final bool rumboArriba;
+  final VoidCallback alPulsar;
+
+  const Brujula({
+    super.key,
+    required this.rumbo,
+    required this.disponible,
+    required this.rumboArriba,
+    required this.alPulsar,
+  });
+
+  static String _punto(double g) {
+    const p = ['N', 'NE', 'E', 'SE', 'S', 'SO', 'O', 'NO'];
+    return p[((g + 22.5) / 45.0).floor() % 8];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final esc = Theme.of(context).colorScheme;
+    return Material(
+      elevation: 4,
+      shape: const CircleBorder(),
+      color: rumboArriba ? esc.primaryContainer : esc.surface,
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: alPulsar,
+        child: SizedBox(
+          width: 80,
+          height: 80,
+          child: ValueListenableBuilder<double?>(
+            valueListenable: rumbo,
+            builder: (context, h, _) {
+              if (!disponible || h == null) {
+                return Center(
+                  child: Text(
+                    disponible ? 'Brújula…' : 'Sin\nsensor',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                );
+              }
+              return Stack(alignment: Alignment.center, children: [
+                Transform.rotate(
+                  angle: -h * math.pi / 180.0,
+                  child: CustomPaint(size: const Size(80, 80), painter: _PintorDial(esc.onSurface, esc.error)),
+                ),
+                Align(
+                  alignment: Alignment.topCenter,
+                  child: Icon(Icons.arrow_drop_down, color: esc.primary, size: 26),
+                ),
+                Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text('${h.round()}°', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                  Text(_punto(h), style: const TextStyle(fontSize: 10)),
+                ]),
+              ]);
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PintorDial extends CustomPainter {
+  final Color color;
+  final Color norte;
+  const _PintorDial(this.color, this.norte);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final centro = size.center(Offset.zero);
+    final r = size.width / 2;
+    final marca = Paint()
+      ..color = color.withAlpha(150)
+      ..strokeWidth = 1.5;
+    // Marcas cada 30° (0° = arriba)
+    for (var g = 0; g < 360; g += 30) {
+      if (g % 90 == 0) continue; // en los cardinales va la letra
+      final a = (g - 90) * math.pi / 180.0;
+      final dir = Offset(math.cos(a), math.sin(a));
+      canvas.drawLine(centro + dir * (r - 8), centro + dir * (r - 2), marca);
+    }
+    const letras = <int, String>{0: 'N', 90: 'E', 180: 'S', 270: 'O'};
+    letras.forEach((g, t) {
+      final tp = TextPainter(
+        text: TextSpan(
+          text: t,
+          style: TextStyle(color: g == 0 ? norte : color, fontSize: 13, fontWeight: FontWeight.bold),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      final a = (g - 90) * math.pi / 180.0;
+      final p = centro + Offset(math.cos(a), math.sin(a)) * (r - 14);
+      tp.paint(canvas, p - Offset(tp.width / 2, tp.height / 2));
+    });
+  }
+
+  @override
+  bool shouldRepaint(covariant _PintorDial o) => o.color != color || o.norte != norte;
 }
