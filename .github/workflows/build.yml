@@ -20,12 +20,12 @@ jobs:
           cache: true
       - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
       
-      - name: Corregir Kotlin, SDK y Permisos con Python
+      - name: Configurar Kotlin 2.1.0, SDK y Permisos con Python
         run: |
           python3 -c "
           import os
 
-          # 1. Actualizar la versión de Kotlin en android/settings.gradle de forma segura
+          # 1. Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
           settings_path = 'android/settings.gradle'
           if os.path.exists(settings_path):
               with open(settings_path, 'r') as f:
@@ -34,7 +34,7 @@ jobs:
               new_settings = []
               for line in lines:
                   if 'org.jetbrains.kotlin.android' in line:
-                      new_settings.append('    id \"org.jetbrains.kotlin.android\" version \"1.9.24\" apply false\n')
+                      new_settings.append('    id \"org.jetbrains.kotlin.android\" version \"2.1.0\" apply false\n')
                   else:
                       new_settings.append(line)
               
