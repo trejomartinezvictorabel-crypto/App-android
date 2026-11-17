@@ -18,7 +18,7 @@ jobs:
         with:
           flutter-version: '3.27.0'
           cache: true
-      - run: flutter create . --org com.albanil.app --platforms=android
+      - run: flutter create . --org com.albanil.app --project-name app_android --platforms=android
       - name: Ajustar SDK 35 con Python
         run: |
           python3 -c "
