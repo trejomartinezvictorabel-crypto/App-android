@@ -18,26 +18,17 @@ jobs:
         with:
           flutter-version: '3.27.0'
           cache: true
-      - name: Inicializar proyecto Flutter si falta
-        run: |
-          if [ ! -f "pubspec.yaml" ]; then
-            flutter create . --org com.albanil.app --platforms=android
-          else
-            echo "El proyecto Flutter ya está inicializado."
-          fi
+      - run: flutter create . --org com.albanil.app --platforms=android
       - name: Ajustar SDK 35 con Python
         run: |
           python3 -c "
           path = 'android/app/build.gradle'
-          try:
-              with open(path, 'r') as f:
-                  content = f.read()
-              content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 35')
-              content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 35')
-              with open(path, 'w') as f:
-                  f.write(content)
-          except FileNotFoundError:
-              print('Archivo build.gradle de Android no encontrado aún.')
+          with open(path, 'r') as f:
+              content = f.read()
+          content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 35')
+          content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 35')
+          with open(path, 'w') as f:
+              f.write(content)
           "
       - run: flutter pub get
       - run: flutter build apk --debug
@@ -45,4 +36,3 @@ jobs:
         with:
           name: app-albanileria-apk
           path: build/app/outputs/flutter-apk/app-debug.apk
-  
