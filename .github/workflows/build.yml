@@ -18,21 +18,37 @@ jobs:
         with:
           flutter-version: '3.27.0'
           cache: true
-      - run: flutter create . --org com.albanil.app --project-name app_android --platforms=android
-      - name: Ajustar SDK 35 con Python
+      - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
+      - name: Ajustar SDK 35 y Permisos con Python
         run: |
           python3 -c "
-          path = 'android/app/build.gradle'
-          with open(path, 'r') as f:
+          # 1. Ajustar SDK 35
+          gradle_path = 'android/app/build.gradle'
+          with open(gradle_path, 'r') as f:
               content = f.read()
           content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 35')
           content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 35')
-          with open(path, 'w') as f:
+          with open(gradle_path, 'w') as f:
               f.write(content)
+
+          # 2. Agregar permisos en AndroidManifest.xml
+          manifest_path = 'android/app/src/main/AndroidManifest.xml'
+          with open(manifest_path, 'r') as f:
+              manifest = f.read()
+          permisos = '''
+              <uses-permission android:name=\"android.permission.INTERNET\"/>
+              <uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>
+              <uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>
+              <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>
+              <uses-permission android:name=\"android.permission.WAKE_LOCK\"/>
+          '''
+          manifest = manifest.replace('<application', permisos + '\n    <application')
+          with open(manifest_path, 'w') as f:
+              f.write(manifest)
           "
       - run: flutter pub get
       - run: flutter build apk --debug
       - uses: actions/upload-artifact@v4
         with:
-          name: app-albanileria-apk
+          name: app-navegacion-apk
           path: build/app/outputs/flutter-apk/app-debug.apk
