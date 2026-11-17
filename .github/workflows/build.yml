@@ -19,20 +19,24 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
       - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
-      - name: Modificar Gradle y Permisos con Python Seguro
+      - name: Configurar Gradle y Permisos Correctamente
         run: |
           python3 -c "
-          import re
-
-          # 1. Modificar build.gradle buscando cualquier minSdkVersion o compileSdkVersion
+          # 1. Modificar android/app/build.gradle con la sintaxis correcta para Gradle moderno
           gradle_path = 'android/app/build.gradle'
           with open(gradle_path, 'r') as f:
               content = f.read()
 
-          # Forzar versiones numéricas directamente mediante expresiones regulares
-          content = re.sub(r'compileSdkVersion\s+.*', 'compileSdkVersion 36', content)
-          content = re.sub(r'targetSdkVersion\s+.*', 'targetSdkVersion 36', content)
-          content = re.sub(r'minSdkVersion\s+.*', 'minSdkVersion 24', content)
+          # Reemplazar las versiones usando la sintaxis de enteros estándar de Gradle
+          content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 36')
+          content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 36')
+          content = content.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 24')
+          content = content.replace('minSdkVersion flutterMinSdkVersion.toInteger()', 'minSdkVersion 24')
+          
+          # Si usa flutter.compileSdkVersion como variable numérica en android { ... }
+          content = content.replace('flutter.compileSdkVersion.toInteger()', '36')
+          content = content.replace('flutter.targetSdkVersion.toInteger()', '36')
+          content = content.replace('flutter.minSdkVersion.toInteger()', '24')
 
           with open(gradle_path, 'w') as f:
               f.write(content)
