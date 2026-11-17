@@ -20,50 +20,59 @@ jobs:
           cache: true
       - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
       
-      - name: Configurar SDK y MinSDK mediante local.properties
+      - name: Actualizar Kotlin, SDK y Permisos con Python
         run: |
-          # En Flutter moderno, forzar los SDKs mediante local.properties o sobrescribiendo el archivo build.gradle evita errores de sintaxis
-          echo "flutter.sdk=$(dirname $(which flutter))/.." > android/local.properties
-          
-          # Inyectar minSdkVersion 24 y target/compile 36 directamente buscando el bloque defaultConfig
           python3 -c "
+          import os
+
+          # 1. Actualizar configuración de Gradle y Kotlin en android/settings.gradle
+          settings_path = 'android/settings.gradle'
+          if os.path.exists(settings_path):
+              with open(settings_path, 'r') as f:
+                  content = f.read()
+              # Actualizar el plugin de Kotlin a la versión 2.1.0
+              content = content.replace('version \"1.', 'version \"2.1.0')
+              content = content.replace('version \\'1.', 'version \\'2.1.0')
+              with open(settings_path, 'w') as f:
+                  f.write(content)
+
+          # 2. Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
           gradle_path = 'android/app/build.gradle'
-          with open(gradle_path, 'r') as f:
-              lines = f.readlines()
+          if os.path.exists(gradle_path):
+              with open(gradle_path, 'r') as f:
+                  lines = f.readlines()
 
-          new_lines = []
-          for line in lines:
-              # Reemplazar las variables de SDK del bloque android por valores fijos seguros
-              if 'compileSdkVersion' in line:
-                  new_lines.append('    compileSdkVersion 36\n')
-              elif 'targetSdkVersion' in line:
-                  new_lines.append('        targetSdkVersion 36\n')
-              elif 'minSdkVersion' in line:
-                  new_lines.append('        minSdkVersion 24\n')
-              else:
-                  new_lines.append(line)
+              new_lines = []
+              for line in lines:
+                  if 'compileSdkVersion' in line:
+                      new_lines.append('    compileSdkVersion 36\n')
+                  elif 'targetSdkVersion' in line:
+                      new_lines.append('        targetSdkVersion 36\n')
+                  elif 'minSdkVersion' in line:
+                      new_lines.append('        minSdkVersion 24\n')
+                  else:
+                      new_lines.append(line)
 
-          with open(gradle_path, 'w') as f:
-              f.writelines(new_lines)
-          "
+              with open(gradle_path, 'w') as f:
+                  f.writelines(new_lines)
 
-          # Agregar permisos en AndroidManifest.xml
-          python3 -c "
+          # 3. Agregar permisos en AndroidManifest.xml
           manifest_path = 'android/app/src/main/AndroidManifest.xml'
-          with open(manifest_path, 'r') as f:
-              manifest = f.read()
-          
-          permisos = '''
-              <uses-permission android:name=\"android.permission.INTERNET\"/>
-              <uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>
-              <uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>
-              <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>
-              <uses-permission android:name=\"android.permission.WAKE_LOCK\"/>
-          '''
-          if '<application' in manifest and 'ACCESS_FINE_LOCATION' not in manifest:
-              manifest = manifest.replace('<application', permisos + '\n    <application')
-              with open(manifest_path, 'w') as f:
-                  f.write(manifest)
+          if os.path.exists(manifest_path):
+              with open(manifest_path, 'r') as f:
+                  manifest = f.read()
+              
+              permisos = '''
+                  <uses-permission android:name=\"android.permission.INTERNET\"/>
+                  <uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>
+                  <uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>
+                  <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>
+                  <uses-permission android:name=\"android.permission.WAKE_LOCK\"/>
+              '''
+              if '<application' in manifest and 'ACCESS_FINE_LOCATION' not in manifest:
+                  manifest = manifest.replace('<application', permisos + '\n    <application')
+                  with open(manifest_path, 'w') as f:
+                      f.write(manifest)
           "
 
       - run: flutter pub get
