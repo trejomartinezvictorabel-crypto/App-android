@@ -23,17 +23,23 @@ jobs:
       - name: Corregir Kotlin, SDK y Permisos con Python
         run: |
           python3 -c "
-          import os, re
+          import os
 
-          # 1. Actualizar la versión de Kotlin limpiamente en android/settings.gradle
+          # 1. Actualizar la versión de Kotlin en android/settings.gradle de forma segura
           settings_path = 'android/settings.gradle'
           if os.path.exists(settings_path):
               with open(settings_path, 'r') as f:
-                  content = f.read()
-              # Reemplaza la versión del plugin de Kotlin por una estable y válida (1.9.24)
-              content = re.sub(r'id\s*[\"\\\']org\.jetbrains\.kotlin\.android[\"\\\']\s+version\s+[\"\\\'][^\"\\\']+[\"\\\']', 'id \"org.jetbrains.kotlin.android\" version \"1.9.24\"', content)
+                  lines = f.readlines()
+              
+              new_settings = []
+              for line in lines:
+                  if 'org.jetbrains.kotlin.android' in line:
+                      new_settings.append('    id \"org.jetbrains.kotlin.android\" version \"1.9.24\" apply false\n')
+                  else:
+                      new_settings.append(line)
+              
               with open(settings_path, 'w') as f:
-                  f.write(content)
+                  f.writelines(new_settings)
 
           # 2. Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
           gradle_path = 'android/app/build.gradle'
