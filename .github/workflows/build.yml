@@ -19,16 +19,20 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
       - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
-      - name: Ajustar SDK 36, minSdkVersion 24 y Permisos con Python
+      - name: Forzar SDK 36, MinSDK 24 y Permisos con Python
         run: |
           python3 -c "
-          # 1. Ajustar SDK a 36 y minSdkVersion a 24 en build.gradle
+          # 1. Forzar compileSdkVersion, targetSdkVersion y minSdkVersion en build.gradle
           gradle_path = 'android/app/build.gradle'
           with open(gradle_path, 'r') as f:
               content = f.read()
+          
+          # Reemplazos limpios para evitar errores de variables de Flutter
           content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 36')
           content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 36')
           content = content.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 24')
+          content = content.replace('minSdkVersion flutterMinSdkVersion.toInteger()', 'minSdkVersion 24')
+          
           with open(gradle_path, 'w') as f:
               f.write(content)
 
