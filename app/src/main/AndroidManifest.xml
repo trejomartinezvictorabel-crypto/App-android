@@ -13,3 +13,39 @@
         </activity>
     </application>
 </manifest>
+# Navegación Offline MX — versión Flutter (un solo main.dart)
+
+## Archivos
+- `main.dart` → `lib/main.dart`
+- `pubspec.yaml` → raíz del proyecto Flutter (ajusta `name:` si tu proyecto ya tiene otro)
+
+## android/app/src/main/AndroidManifest.xml
+Dentro de `<manifest>` (antes de `<application>`):
+
+```xml
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+<uses-permission android:name="android.permission.WAKE_LOCK"/>
+<uses-permission android:name="android.permission.RECORD_AUDIO"/>
+<queries>
+    <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
+    <intent><action android:name="android.speech.RecognitionService"/></intent>
+</queries>
+```
+No declares `INTERNET`: la app no lo necesita (en modo release Flutter no lo exige; en debug/profile Flutter lo agrega solo).
+
+## android/app/build.gradle
+`minSdk` 23 o mayor (geolocator/sqflite lo permiten), `compileSdk`/`targetSdk` los que ya uses (34–36).
+
+## Uso en campo
+1. **Mapa**: Ajustes → *Importar mapa* y elige un `.mbtiles` de **teselas raster** (PNG/JPG), p. ej. de QGIS (Generate XYZ tiles → MBTiles) o MOBAC. No acepta MBTiles vectoriales (.pbf).
+2. **Rutas por calles**: Ajustes → *Importar red vial* con un GeoJSON de OSM (LineString con propiedad `highway`; exporta con osmtogeojson/QGIS solo tu zona, idealmente < 30 MB). Sin red vial, la ruta es línea recta.
+3. Mantén presionado el mapa para fijar destino → *Iniciar*.
+4. Micrófono: di «iniciar navegación», «cancelar», «modo bicicleta», «cuánto falta», «repite», «guarda este punto», «llévame a <lugar guardado>». Para que sea offline instala el paquete de voz en español (Ajustes de Google → Voz → Reconocimiento sin conexión).
+
+## Diferencias con la versión Kotlin
+- Audio Focus lo gestiona `flutter_tts` (`focus: true`): baja/pausa la música al hablar y no habla sobre una llamada, pero no permite elegir entre «bajar volumen» y «pausar».
+- El enrutamiento carga el GeoJSON completo en memoria durante la importación (en un isolate); la versión Kotlin lo lee en streaming.
