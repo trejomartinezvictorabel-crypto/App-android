@@ -36,3 +36,33 @@ jobs:
         with:
           name: app-albanileria-apk
           path: build/app/outputs/flutter-apk/app-debug.apk
+          name: navegacion_offline_mx
+description: Navegación multimodal offline para trabajo de campo en México.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_map: ^6.2.1
+  latlong2: ^0.9.1
+  geolocator: ^12.0.0
+  flutter_tts: ^4.0.2
+  speech_to_text: ^7.0.0
+  sqflite: ^2.3.3+1
+  path: ^1.9.0
+  path_provider: ^2.1.4
+  file_picker: ^8.1.2
+  permission_handler: ^11.3.1
+  wakelock_plus: ^1.2.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
