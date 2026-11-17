@@ -19,20 +19,21 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
       - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
-      - name: Forzar SDK 36, MinSDK 24 y Permisos con Python
+      - name: Modificar Gradle y Permisos con Python Seguro
         run: |
           python3 -c "
-          # 1. Forzar compileSdkVersion, targetSdkVersion y minSdkVersion en build.gradle
+          import re
+
+          # 1. Modificar build.gradle buscando cualquier minSdkVersion o compileSdkVersion
           gradle_path = 'android/app/build.gradle'
           with open(gradle_path, 'r') as f:
               content = f.read()
-          
-          # Reemplazos limpios para evitar errores de variables de Flutter
-          content = content.replace('compileSdkVersion flutter.compileSdkVersion', 'compileSdkVersion 36')
-          content = content.replace('targetSdkVersion flutter.targetSdkVersion', 'targetSdkVersion 36')
-          content = content.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 24')
-          content = content.replace('minSdkVersion flutterMinSdkVersion.toInteger()', 'minSdkVersion 24')
-          
+
+          # Forzar versiones numéricas directamente mediante expresiones regulares
+          content = re.sub(r'compileSdkVersion\s+.*', 'compileSdkVersion 36', content)
+          content = re.sub(r'targetSdkVersion\s+.*', 'targetSdkVersion 36', content)
+          content = re.sub(r'minSdkVersion\s+.*', 'minSdkVersion 24', content)
+
           with open(gradle_path, 'w') as f:
               f.write(content)
 
@@ -47,9 +48,10 @@ jobs:
               <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>
               <uses-permission android:name=\"android.permission.WAKE_LOCK\"/>
           '''
-          manifest = manifest.replace('<application', permisos + '\n    <application')
-          with open(manifest_path, 'w') as f:
-              f.write(manifest)
+          if '<application' in manifest and 'ACCESS_FINE_LOCATION' not in manifest:
+              manifest = manifest.replace('<application', permisos + '\n    <application')
+              with open(manifest_path, 'w') as f:
+                  f.write(manifest)
           "
       - run: flutter pub get
       - run: flutter build apk --debug
