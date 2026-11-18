@@ -18,6 +18,9 @@ jobs:
         with:
           flutter-version: '3.27.0'
           cache: true
+
+      - name: Generar plataforma Android base
+        run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
       
       - name: Parchear Gradle, pubspec, Kotlin y Permisos con Python
         run: |
@@ -65,7 +68,6 @@ jobs:
           if os.path.exists(wrapper_path):
               with open(wrapper_path, 'r') as f:
                   wrapper_content = f.read()
-              # Reemplazar la URL de distribución por una moderna
               new_wrapper = wrapper_content.split('distributionUrl=')[0] + 'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-bin.zip\n'
               with open(wrapper_path, 'w') as f:
                   f.write(new_wrapper)
@@ -94,20 +96,20 @@ jobs:
 
               new_lines = []
               for line in lines:
-                if 'compileSdkVersion' in line:
-                    new_lines.append('    compileSdkVersion 36\n')
-                elif 'targetSdkVersion' in line:
-                    new_lines.append('        targetSdkVersion 36\n')
-                elif 'minSdkVersion' in line:
-                    new_lines.append('        minSdkVersion 24\n')
-                elif 'compileSdk ' in line:
-                    new_lines.append('    compileSdk 36\n')
-                elif 'targetSdk ' in line:
-                    new_lines.append('        targetSdk 36\n')
-                elif 'minSdk ' in line:
-                    new_lines.append('        minSdk 24\n')
-                else:
-                    new_lines.append(line)
+                  if 'compileSdkVersion' in line:
+                      new_lines.append('    compileSdkVersion 36\n')
+                  elif 'targetSdkVersion' in line:
+                      new_lines.append('        targetSdkVersion 36\n')
+                  elif 'minSdkVersion' in line:
+                      new_lines.append('        minSdkVersion 24\n')
+                  elif 'compileSdk ' in line:
+                      new_lines.append('    compileSdk 36\n')
+                  elif 'targetSdk ' in line:
+                      new_lines.append('        targetSdk 36\n')
+                  elif 'minSdk ' in line:
+                      new_lines.append('        minSdk 24\n')
+                  else:
+                      new_lines.append(line)
 
               with open(gradle_path, 'w') as f:
                   f.writelines(new_lines)
