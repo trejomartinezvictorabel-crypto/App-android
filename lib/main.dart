@@ -1118,6 +1118,7 @@ class Controlador extends ChangeNotifier {
   Position? ubic;
   double velKmh = 0;
   bool permisoOk = false;
+  bool permisosCompletos = true; // false = falta algún permiso (se muestra el aviso «Conceder»)
   bool gpsActivo = true;
   LatLng? destino;
   String destinoNombre = '';
@@ -1180,6 +1181,7 @@ class Controlador extends ChangeNotifier {
     await iniciarGps(); // ubicación (diálogo del sistema)
     _iniciarBrujula();
     await pedirPermisos();
+    await revisarPermisos();
   }
 
   /// Pide el resto de permisos de una vez. Solo pregunta por lo que aún no está concedido.
@@ -1190,6 +1192,44 @@ class Controlador extends ChangeNotifier {
     if (mapas.isEmpty && !await _tienePermisoDescargas()) {
       await _pedirPermisoDescargas();
       await _abrirMapas();
+    }
+  }
+
+  /// Comprueba si están todos los permisos. El de archivos solo cuenta si aún no hay mapas cargados
+  /// (con «Elegir y copiar un .mbtiles…» el mapa vive en la carpeta de la app y no lo necesita).
+  Future<bool> revisarPermisos() async {
+    final ok = await Permission.locationWhenInUse.isGranted &&
+        await Permission.microphone.isGranted &&
+        await Permission.notification.isGranted &&
+        (mapas.isNotEmpty || await _tienePermisoDescargas());
+    if (ok != permisosCompletos) {
+      permisosCompletos = ok;
+      notifyListeners();
+    }
+    return ok;
+  }
+
+  /// Un solo toque: pide ubicación, micrófono, notificaciones y archivos (Descargas).
+  /// Internet no se pide en ejecución: basta con declararlo en el AndroidManifest.
+  Future<void> pedirTodosPermisos() async {
+    final estados = await [
+      Permission.locationWhenInUse,
+      Permission.microphone,
+      Permission.notification,
+    ].request();
+    await _pedirPermisoDescargas(); // Android 11+: abre «Acceso a todos los archivos»
+    final bloqueado = estados.values.any((e) => e.isPermanentlyDenied) ||
+        await Permission.manageExternalStorage.isPermanentlyDenied;
+    await iniciarGps(reiniciar: true);
+    await _abrirMapas();
+    final ok = await revisarPermisos();
+    if (ok) {
+      _msg('Todos los permisos concedidos.');
+    } else if (bloqueado) {
+      _msg('Activa los permisos que faltan en Ajustes de la app.');
+      await openAppSettings();
+    } else {
+      _msg('Aún faltan algunos permisos.');
     }
   }
 
@@ -1207,6 +1247,7 @@ class Controlador extends ChangeNotifier {
     // Si no había mapas, se vuelve a buscar (quizá acabas de copiar el .mbtiles a Descargas
     // o de conceder «Acceso a todos los archivos»).
     if (mapas.isEmpty) await _abrirMapas();
+    await revisarPermisos();
   }
 
   Future<void> alOcultar() async {
@@ -2063,6 +2104,9 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                       await c.iniciarGps(reiniciar: true);
                       if (!c.permisoOk) await Geolocator.openAppSettings();
                     }),
+                  if (!c.permisosCompletos)
+                    _aviso('Faltan permisos: ubicación, micrófono, notificaciones o archivos.', 'Conceder',
+                        c.pedirTodosPermisos),
                   if (c.permisoOk && !c.gpsActivo)
                     _aviso('El GPS está apagado.', 'Activar', Geolocator.openLocationSettings),
                   if (c.mapas.isEmpty)
