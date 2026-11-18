@@ -22,17 +22,16 @@ jobs:
       - name: 1. Crear pubspec.yaml y descargar modelo de Vosk automáticamente
         run: |
           python3 -c "
-          import os, urllib.request
+          import os
 
           # Asegurar que exista la carpeta assets/models
           os.makedirs('assets/models', exist_ok=True)
 
-          # Descargar el modelo de Vosk en español si no está presente
+          # Descargar el modelo de Vosk en español de forma robusta con curl
           model_zip = 'assets/models/vosk-model-small-es-0.42.zip'
-          if not os.path.exists(model_zip):
+          if not os.path.exists(model_zip) or os.path.getsize(model_zip) < 1000000:
               print('Descargando el modelo de Vosk (español)...')
-              url = 'https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip'
-              urllib.request.urlretrieve(url, model_zip)
+              os.system(f'curl -L \"https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip\" -o {model_zip}')
               print('¡Modelo descargado y colocado en assets/models/ con éxito!')
 
           pubspec_content = '''name: navegacion_offline_mx
@@ -129,7 +128,7 @@ jobs:
                   elif 'targetSdk ' in line:
                       new_lines.append('        targetSdk 36\n')
                   elif 'minSdk ' in line:
-                      new_lines.append('        minSdk 24\n')
+                      new_lines.append('    minSdk 24\n')
                   else:
                       new_lines.append(line)
 
