@@ -19,7 +19,7 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
       
-      - name: Corregir pubspec.yaml, Kotlin, SDK y Permisos con Python
+      - name: Parchear Gradle, pubspec, Kotlin y Permisos con Python
         run: |
           python3 -c "
           import os
@@ -60,7 +60,17 @@ jobs:
           with open('pubspec.yaml', 'w') as f:
               f.write(pubspec_content)
 
-          # 2. Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
+          # 2. Actualizar Gradle Wrapper a la versión 8.10.2 (compatible con Flutter 3.27)
+          wrapper_path = 'android/gradle/wrapper/gradle-wrapper.properties'
+          if os.path.exists(wrapper_path):
+              with open(wrapper_path, 'r') as f:
+                  wrapper_content = f.read()
+              # Reemplazar la URL de distribución por una moderna
+              new_wrapper = wrapper_content.split('distributionUrl=')[0] + 'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-bin.zip\n'
+              with open(wrapper_path, 'w') as f:
+                  f.write(new_wrapper)
+
+          # 3. Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
           settings_path = 'android/settings.gradle'
           if os.path.exists(settings_path):
               with open(settings_path, 'r') as f:
@@ -76,7 +86,7 @@ jobs:
               with open(settings_path, 'w') as f:
                   f.writelines(new_settings)
 
-          # 3. Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
+          # 4. Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
           gradle_path = 'android/app/build.gradle'
           if os.path.exists(gradle_path):
               with open(gradle_path, 'r') as f:
@@ -84,19 +94,25 @@ jobs:
 
               new_lines = []
               for line in lines:
-                  if 'compileSdkVersion' in line:
-                      new_lines.append('    compileSdkVersion 36\n')
-                  elif 'targetSdkVersion' in line:
-                      new_lines.append('        targetSdkVersion 36\n')
-                  elif 'minSdkVersion' in line:
-                      new_lines.append('        minSdkVersion 24\n')
-                  else:
-                      new_lines.append(line)
+                if 'compileSdkVersion' in line:
+                    new_lines.append('    compileSdkVersion 36\n')
+                elif 'targetSdkVersion' in line:
+                    new_lines.append('        targetSdkVersion 36\n')
+                elif 'minSdkVersion' in line:
+                    new_lines.append('        minSdkVersion 24\n')
+                elif 'compileSdk ' in line:
+                    new_lines.append('    compileSdk 36\n')
+                elif 'targetSdk ' in line:
+                    new_lines.append('        targetSdk 36\n')
+                elif 'minSdk ' in line:
+                    new_lines.append('        minSdk 24\n')
+                else:
+                    new_lines.append(line)
 
               with open(gradle_path, 'w') as f:
                   f.writelines(new_lines)
 
-          # 4. Agregar permisos en AndroidManifest.xml
+          # 5. Agregar permisos en AndroidManifest.xml
           manifest_path = 'android/app/src/main/AndroidManifest.xml'
           if os.path.exists(manifest_path):
               with open(manifest_path, 'r') as f:
