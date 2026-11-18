@@ -19,12 +19,48 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
       
-      - name: Configurar Kotlin 2.1.0, SDK y Permisos con Python
+      - name: Corregir pubspec.yaml, Kotlin, SDK y Permisos con Python
         run: |
           python3 -c "
           import os
 
-          # 1. Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
+          # 1. Asegurar un pubspec.yaml válido con todas las dependencias
+          pubspec_content = '''name: navegacion_offline_mx
+          description: Navegación multimodal offline para trabajo de campo en México.
+          publish_to: \"none\"
+          version: 1.0.0+1
+
+          environment:
+            sdk: \">=3.3.0 <4.0.0\"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            flutter_map: ^6.2.1
+            latlong2: ^0.9.1
+            geolocator: ^12.0.0
+            flutter_tts: ^4.0.2
+            speech_to_text: ^7.0.0
+            sqflite: ^2.3.3+1
+            path: ^1.9.0
+            path_provider: ^2.1.4
+            file_picker: ^8.1.2
+            permission_handler: ^11.3.1
+            wakelock_plus: ^1.2.8
+            flutter_compass: ^0.8.1
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^4.0.0
+
+          flutter:
+            uses-material-design: true
+          '''
+          with open('pubspec.yaml', 'w') as f:
+              f.write(pubspec_content)
+
+          # 2. Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
           settings_path = 'android/settings.gradle'
           if os.path.exists(settings_path):
               with open(settings_path, 'r') as f:
@@ -40,7 +76,7 @@ jobs:
               with open(settings_path, 'w') as f:
                   f.writelines(new_settings)
 
-          # 2. Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
+          # 3. Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
           gradle_path = 'android/app/build.gradle'
           if os.path.exists(gradle_path):
               with open(gradle_path, 'r') as f:
@@ -60,7 +96,7 @@ jobs:
               with open(gradle_path, 'w') as f:
                   f.writelines(new_lines)
 
-          # 3. Agregar permisos en AndroidManifest.xml
+          # 4. Agregar permisos en AndroidManifest.xml
           manifest_path = 'android/app/src/main/AndroidManifest.xml'
           if os.path.exists(manifest_path):
               with open(manifest_path, 'r') as f:
