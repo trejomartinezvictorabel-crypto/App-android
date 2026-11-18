@@ -19,11 +19,21 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
 
-      - name: 1. Crear pubspec.yaml con overrides de dependencias
+      - name: 1. Crear pubspec.yaml y descargar modelo de Vosk automáticamente
         run: |
           python3 -c "
-          import os
+          import os, urllib.request
+
+          # Asegurar que exista la carpeta assets/models
           os.makedirs('assets/models', exist_ok=True)
+
+          # Descargar el modelo de Vosk en español si no está presente
+          model_zip = 'assets/models/vosk-model-small-es-0.42.zip'
+          if not os.path.exists(model_zip):
+              print('Descargando el modelo de Vosk (español)...')
+              url = 'https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip'
+              urllib.request.urlretrieve(url, model_zip)
+              print('¡Modelo descargado y colocado en assets/models/ con éxito!')
 
           pubspec_content = '''name: navegacion_offline_mx
           description: Navegación multimodal offline para México.
@@ -159,7 +169,6 @@ jobs:
           python3 -c "
           import os, glob
 
-          # Limpiar atributo package obsoleto del AndroidManifest.xml de vosk_flutter
           for manifest_path in glob.glob('/home/runner/.pub-cache/hosted/**/vosk_flutter-*/android/src/main/AndroidManifest.xml', recursive=True):
               with open(manifest_path, 'r') as f:
                   content = f.read()
@@ -169,7 +178,6 @@ jobs:
                       f.write(content)
                   print(f'Eliminado package en manifiesto: {manifest_path}')
 
-          # Inyectar namespace en el build.gradle de vosk_flutter
           for bg_path in glob.glob('/home/runner/.pub-cache/hosted/**/vosk_flutter-*/android/build.gradle', recursive=True):
               with open(bg_path, 'r') as f:
                   content = f.read()
