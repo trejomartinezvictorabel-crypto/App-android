@@ -2524,6 +2524,12 @@ class PantallaMenu extends StatelessWidget {
         onChanged: c.establecerVoz,
       ),
       const Divider(),
+      const Text('Permisos', style: TextStyle(fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      FilledButton(onPressed: c.pedirTodosPermisos, child: const Text('Conceder permisos')),
+      const SizedBox(height: 8),
+      OutlinedButton(onPressed: openAppSettings, child: const Text('Abrir ajustes de la app')),
+      const Divider(),
       const Text('Mapas offline (.mbtiles raster)', style: TextStyle(fontWeight: FontWeight.bold)),
       if (c.mapas.isEmpty) const Text('No hay mapas. Copia el .mbtiles a la carpeta Descargas y pulsa «Buscar en Descargas».'),
       for (final m in c.mapas)
