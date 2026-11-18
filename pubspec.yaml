@@ -18,21 +18,20 @@ jobs:
         with:
           flutter-version: '3.27.0'
           cache: true
-      - run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
-      
-      - name: Inyectar dependencias completas y configurar Gradle
+
+      - name: 1. Crear pubspec.yaml unificado (con Vosk y assets)
         run: |
           python3 -c "
           import os
+          os.makedirs('assets/models', exist_ok=True)
 
-          # 1. Reescribir pubspec.yaml con todas las dependencias requeridas
           pubspec_content = '''name: navegacion_offline_mx
-          description: Navegación multimodal offline para trabajo de campo en México.
+          description: Navegación multimodal offline para México.
           publish_to: \"none\"
           version: 1.0.0+1
 
           environment:
-            sdk: \">=3.3.0 <4.0.0\"
+            sdk: \">=3.0.0 <4.0.0\"
 
           dependencies:
             flutter:
@@ -42,6 +41,7 @@ jobs:
             geolocator: ^12.0.0
             flutter_tts: ^4.0.2
             speech_to_text: ^7.0.0
+            vosk_flutter: ^0.3.48
             sqflite: ^2.3.3+1
             path: ^1.9.0
             path_provider: ^2.1.4
@@ -57,9 +57,29 @@ jobs:
 
           flutter:
             uses-material-design: true
+            assets:
+              - assets/models/
           '''
           with open('pubspec.yaml', 'w') as f:
               f.write(pubspec_content)
+          "
+
+      - name: 2. Generar plataforma Android base
+        run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
+      
+      - name: 3. Parchear Gradle, Kotlin, SDK y Permisos con Python
+        run: |
+          python3 -c "
+          import os
+
+          # 1. Actualizar Gradle Wrapper a 8.10.2
+          wrapper_path = 'android/gradle/wrapper/gradle-wrapper.properties'
+          if os.path.exists(wrapper_path):
+              with open(wrapper_path, 'r') as f:
+                  wrapper_content = f.read()
+              new_wrapper = wrapper_content.split('distributionUrl=')[0] + 'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-bin.zip\n'
+              with open(wrapper_path, 'w') as f:
+                  f.write(new_wrapper)
 
           # 2. Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
           settings_path = 'android/settings.gradle'
@@ -91,6 +111,12 @@ jobs:
                       new_lines.append('        targetSdkVersion 36\n')
                   elif 'minSdkVersion' in line:
                       new_lines.append('        minSdkVersion 24\n')
+                  elif 'compileSdk ' in line:
+                      new_lines.append('    compileSdk 36\n')
+                  elif 'targetSdk ' in line:
+                      new_lines.append('        targetSdk 36\n')
+                  elif 'minSdk ' in line:
+                      new_lines.append('        minSdk 24\n')
                   else:
                       new_lines.append(line)
 
@@ -131,3 +157,4 @@ jobs:
         with:
           name: app-navegacion-apk
           path: build/app/outputs/flutter-apk/app-debug.apk
+
