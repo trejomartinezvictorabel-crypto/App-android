@@ -154,6 +154,22 @@ jobs:
                       f.write(manifest)
           "
 
+      - name: 4. Parche de namespace para plugins antiguos (vosk_flutter)
+        run: |
+          python3 -c "
+          import os, glob
+          for bg_path in glob.glob('/home/runner/.pub-cache/hosted/**/*.gradle', recursive=True):
+              if 'vosk_flutter' in bg_path:
+                  with open(bg_path, 'r') as f:
+                      content = f.read()
+                  if 'namespace ' not in content:
+                      # Insertar namespace dentro del bloque android { ... }
+                      new_content = content.replace('android {', 'android {\n    namespace \"org.alphacep.vosk\"\n', 1)
+                      with open(bg_path, 'w') as f:
+                          f.write(new_content)
+                          print(f'Parcheado namespace en: {bg_path}')
+          "
+
       - run: flutter pub get
       - run: flutter build apk --debug
       - uses: actions/upload-artifact@v4
