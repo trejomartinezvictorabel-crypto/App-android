@@ -4,6 +4,45 @@
 //  Voz (TTS/STT) manos libres · SQLite local (POIs, rutas frecuentes, historial)
 //  Sin internet en tiempo de ejecución. Requiere Dart >= 3.0.
 // ============================================================================
+// ----------------------------------------------------------------------------
+//  CONFIGURACIÓN COMPLETA (Flutter exige que viva fuera de este archivo;
+//  se deja aquí copiada para tener todo en una sola pieza)
+//
+//  A) PERMISOS  →  android/app/src/main/AndroidManifest.xml
+//     (NO van en pubspec.yaml). Entre <manifest> y <application>:
+//
+//     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+//     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+//     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+//     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+//     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+//     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+//     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+//     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
+//     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+//     <queries>
+//         <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
+//         <intent><action android:name="android.speech.RecognitionService"/></intent>
+//     </queries>
+//
+//  B) PAQUETES  →  pubspec.yaml, sección dependencies: (solo paquetes, nunca permisos)
+//
+//     flutter_map: ^6.2.1
+//     latlong2: ^0.9.1
+//     geolocator: ^12.0.0
+//     flutter_tts: ^4.0.2
+//     speech_to_text: ^7.0.0
+//     sqflite: ^2.3.3+1
+//     path: ^1.9.0
+//     path_provider: ^2.1.4
+//     file_picker: ^8.1.2
+//     permission_handler: ^11.3.1
+//     wakelock_plus: ^1.2.8
+//     flutter_compass: ^0.8.1
+//
+//  C) En tiempo de ejecución la app pide los permisos sola (ubicación, notificaciones,
+//     micrófono y acceso a Descargas): ver Controlador.pedirPermisos().
+// ----------------------------------------------------------------------------
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -24,6 +63,7 @@ import 'package:latlong2/latlong.dart';
 import 'package:path/path.dart' as ruta_p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -782,62 +822,112 @@ class GuiaVoz {
   }
 }
 
-/// Reconocimiento de voz para comandos manos libres. Prefiere el modo sin conexión (requiere el paquete
-/// de voz en español descargado en Google > Ajustes > Voz > Reconocimiento sin conexión).
+/// Reconocimiento de voz para comandos manos libres.
+/// 1) Intenta primero SIN conexión (paquete de voz en español descargado en el teléfono).
+/// 2) Si el teléfono no tiene el paquete (error_language_not_supported), reintenta UNA vez con el
+///    reconocedor normal de Google (necesita internet) en lugar de quedarse con el error.
+/// 3) Si tampoco se puede, explica exactamente cómo descargar el paquete sin conexión.
 class Escucha {
   final SpeechToText _stt = SpeechToText();
   bool _init = false;
+  bool _soloOnDevice = true;
+  bool _yaReintento = false;
+  String? _idioma;
   void Function(bool)? _alEstado;
   void Function(String)? _alError;
+  void Function(String)? _alResultado;
 
   Future<void> escuchar({
     required void Function(String) alResultado,
     required void Function(String) alError,
     required void Function(bool) alEstado,
   }) async {
-    _alEstado = alEstado;
+    _alResultado = alResultado;
     _alError = alError;
+    _alEstado = alEstado;
+    _soloOnDevice = true;
+    _yaReintento = false;
     if (!_init) {
       _init = await _stt.initialize(
         onStatus: (s) {
           if (s == 'done' || s == 'notListening') _alEstado?.call(false);
         },
-        onError: (e) {
-          _alEstado?.call(false);
-          _alError?.call('Voz: ${e.errorMsg}. Revisa el permiso de micrófono y el paquete de voz sin conexión.');
-        },
+        onError: _alFallar,
       );
     }
     if (!_init) {
       alError('Reconocimiento de voz no disponible o permiso de micrófono negado.');
       return;
     }
-    String? idioma;
+    _idioma = await _elegirIdioma();
+    await _iniciar();
+  }
+
+  Future<String?> _elegirIdioma() async {
+    String? es;
     for (final l in await _stt.locales()) {
       final id = l.localeId.replaceAll('-', '_');
-      if (id == 'es_MX') {
-        idioma = l.localeId;
-        break;
-      }
-      if (id.startsWith('es') && idioma == null) idioma = l.localeId;
+      if (id == 'es_MX') return l.localeId;
+      if (id.startsWith('es') && es == null) es = l.localeId;
     }
-    alEstado(true);
+    return es; // null = idioma del sistema
+  }
+
+  Future<void> _iniciar() async {
+    try {
+      await _stt.cancel();
+    } catch (_) {}
+    _alEstado?.call(true);
     await _stt.listen(
       onResult: (r) {
-        if (r.finalResult) {
-          alEstado(false);
-          if (r.recognizedWords.trim().isEmpty) {
-            alError('No te escuché, intenta de nuevo.');
-          } else {
-            alResultado(r.recognizedWords);
-          }
+        if (!r.finalResult) return;
+        _alEstado?.call(false);
+        final t = r.recognizedWords.trim();
+        if (t.isEmpty) {
+          _alError?.call('No te escuché, intenta de nuevo.');
+        } else {
+          _alResultado?.call(t);
         }
       },
-      localeId: idioma,
+      localeId: _idioma,
       listenFor: const Duration(seconds: 8),
       pauseFor: const Duration(seconds: 3),
-      listenOptions: SpeechListenOptions(onDevice: true, partialResults: false, cancelOnError: true),
+      listenOptions: SpeechListenOptions(onDevice: _soloOnDevice, partialResults: false, cancelOnError: true),
     );
+  }
+
+  void _alFallar(SpeechRecognitionError e) {
+    final sinIdioma = e.errorMsg == 'error_language_not_supported' || e.errorMsg == 'error_language_unavailable';
+    if (sinIdioma && _soloOnDevice && !_yaReintento) {
+      _yaReintento = true;
+      _soloOnDevice = false; // reintenta con el reconocedor normal de Google
+      Future<void>.delayed(const Duration(milliseconds: 300), _iniciar);
+      return;
+    }
+    _alEstado?.call(false);
+    _alError?.call(_mensaje(e.errorMsg));
+  }
+
+  String _mensaje(String e) {
+    switch (e) {
+      case 'error_language_not_supported':
+      case 'error_language_unavailable':
+        return 'Falta el español sin conexión. Descárgalo en: app Google → tu foto → Configuración → '
+            'Voz → Reconocimiento de voz sin conexión → Español (México).';
+      case 'error_permission':
+        return 'Concede el permiso de micrófono a la app.';
+      case 'error_no_match':
+      case 'error_speech_timeout':
+        return 'No te escuché, intenta de nuevo.';
+      case 'error_network':
+      case 'error_network_timeout':
+      case 'error_server':
+        return 'Sin internet y sin paquete de voz offline. Descarga el español sin conexión (app Google → Voz).';
+      case 'error_busy':
+        return 'El reconocedor está ocupado, intenta de nuevo.';
+      default:
+        return 'Voz: $e';
+    }
   }
 
   Future<void> cancelar() => _stt.cancel();
@@ -931,18 +1021,28 @@ Cmd interpretarComando(String original) {
 // ============================================================================
 // 7. MAPA OFFLINE: PROVEEDOR DE TESELAS MBTILES (RASTER)
 // ============================================================================
+//
+//  CAUSA DEL FONDO MORADO: antes, cuando una tesela no existía, se devolvía un PNG de 1x1 que en
+//  realidad era un píxel AZUL semitransparente. Al estirarse a toda la pantalla sobre el fondo gris
+//  daba exactamente ese morado. Ahora la tesela vacía es un píxel 100 % TRANSPARENTE (se ve el
+//  fondo gris) y nunca se lanza una excepción que rompa el renderizado.
 
-/// 1x1 PNG transparente para teselas que no existen en el archivo.
-final Uint8List _pngVacio = base64Decode(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==');
+/// Tesela sin datos: 1x1 RGBA totalmente transparente (píxeles crudos, sin PNG de por medio).
+Future<ui.Codec> _codecTransparente() async {
+  final buffer = await ui.ImmutableBuffer.fromUint8List(Uint8List(4)); // R,G,B,A = 0
+  final descriptor = ui.ImageDescriptor.raw(buffer, width: 1, height: 1, pixelFormat: ui.PixelFormat.rgba8888);
+  return descriptor.instantiateCodec();
+}
 
 class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
   final List<Database> bases;
   final int x, y, z;
   const _ImagenMbTile(this.bases, this.x, this.y, this.z);
 
-  Future<Uint8List> _leer() async {
-    final fila = (1 << z) - 1 - y; // MBTiles usa esquema TMS (eje Y invertido)
+  /// Lee la tesela de la tabla `tiles` (zoom_level, tile_column, tile_row, tile_data).
+  Future<Uint8List?> _leer() async {
+    // MBTiles usa esquema TMS (Y invertida); flutter_map usa XYZ  →  y_tms = (1 << z) - 1 - y
+    final fila = (1 << z) - 1 - y;
     for (final db in bases) {
       try {
         final r = await db.rawQuery(
@@ -950,16 +1050,22 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
             [z, x, fila]);
         if (r.isNotEmpty) {
           final d = r.first['tile_data'];
-          if (d is Uint8List) return d;
+          if (d is Uint8List && d.isNotEmpty) return d;
         }
       } catch (_) {}
     }
-    return _pngVacio;
+    return null; // no existe en la base offline
   }
 
   Future<ui.Codec> _decodificar(ImageDecoderCallback decode) async {
-    final buffer = await ui.ImmutableBuffer.fromUint8List(await _leer());
-    return decode(buffer);
+    try {
+      final datos = await _leer();
+      if (datos == null) return _codecTransparente();
+      final buffer = await ui.ImmutableBuffer.fromUint8List(datos);
+      return await decode(buffer); // el await permite atrapar datos corruptos
+    } catch (_) {
+      return _codecTransparente();
+    }
   }
 
   @override
@@ -1026,6 +1132,9 @@ class Controlador extends ChangeNotifier {
   bool redCargada = false;
   String redEstado = 'Sin red vial: se usa ruta en línea recta';
   List<MapaLocal> mapas = [];
+  // Rango de zoom real de los .mbtiles cargados y área que cubren (metadata "bounds")
+  int zoomMinTiles = 0, zoomMaxTiles = 19;
+  LatLngBounds? limitesMapa;
   // Brújula: ValueNotifier aparte para redibujar SOLO el widget de la brújula (no toda la pantalla)
   final ValueNotifier<double?> brujula = ValueNotifier<double?>(null);
   bool brujulaDisponible = true;
@@ -1036,6 +1145,13 @@ class Controlador extends ChangeNotifier {
   List<RutaFrec> rutasFrec = [];
   List<Hist> historial = [];
   TileProvider proveedorTiles = ProveedorMbTiles(const []);
+
+  /// true si hay mapas cargados con área conocida y el usuario está fuera de ella.
+  bool get fueraDeMapa {
+    final b = limitesMapa, u = ubic;
+    if (b == null || u == null || mapas.isEmpty) return false;
+    return !b.contains(LatLng(u.latitude, u.longitude));
+  }
 
   // --- Estado interno ---
   StreamSubscription<Position>? _sub;
@@ -1061,8 +1177,20 @@ class Controlador extends ChangeNotifier {
     await voz.iniciar();
     await _abrirMapas();
     await _cargarRedGuardada();
-    await iniciarGps();
+    await iniciarGps(); // ubicación (diálogo del sistema)
     _iniciarBrujula();
+    await pedirPermisos();
+  }
+
+  /// Pide el resto de permisos de una vez. Solo pregunta por lo que aún no está concedido.
+  Future<void> pedirPermisos() async {
+    if (await Permission.notification.isDenied) await Permission.notification.request();
+    if (await Permission.microphone.isDenied) await Permission.microphone.request();
+    // Descargas: solo si no hay mapas cargados (en Android 11+ abre «Acceso a todos los archivos»)
+    if (mapas.isEmpty && !await _tienePermisoDescargas()) {
+      await _pedirPermisoDescargas();
+      await _abrirMapas();
+    }
   }
 
   Future<void> _recargar() async {
@@ -1426,6 +1554,11 @@ class Controlador extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    // Permiso de micrófono ANTES de escuchar
+    if (!await Permission.microphone.isGranted) {
+      final r = await Permission.microphone.request();
+      if (!r.isGranted) return _msg('Concede el permiso de micrófono para usar comandos de voz.');
+    }
     await voz.silenciar(); // evita que el micrófono capte la guía
     await stt.escuchar(
       alEstado: (a) {
@@ -1564,6 +1697,29 @@ class Controlador extends ChangeNotifier {
     return <File>[];
   }
 
+  /// Formato declarado en la tabla metadata del MBTiles ("png", "jpg", "pbf"...).
+  Future<String> _formatoMb(Database db) async {
+    try {
+      final r = await db.rawQuery("SELECT value FROM metadata WHERE name = 'format'");
+      return r.isEmpty ? '' : '${r.first['value']}'.toLowerCase().trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// Área del mapa según metadata "bounds" = "oeste,sur,este,norte".
+  Future<LatLngBounds?> _limitesMb(Database db) async {
+    try {
+      final r = await db.rawQuery("SELECT value FROM metadata WHERE name = 'bounds'");
+      if (r.isEmpty) return null;
+      final p = '${r.first['value']}'.split(',').map((e) => double.tryParse(e.trim())).toList();
+      if (p.length != 4 || p.any((e) => e == null)) return null;
+      return LatLngBounds(LatLng(p[1]!, p[0]!), LatLng(p[3]!, p[2]!));
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Abre los .mbtiles de Descargas (si hay permiso) y los importados al almacenamiento propio.
   /// Los de Descargas se leen EN SITIO: no se copian ni se duplica el espacio.
   Future<void> _abrirMapas() async {
@@ -1590,13 +1746,35 @@ class Controlador extends ChangeNotifier {
 
     final validos = <MapaLocal>[];
     final invalidos = <String>[];
+    final vectoriales = <String>[];
     final vistos = <String>{};
+    var zMin = 99, zMax = -1;
+    LatLngBounds? unionBounds;
     for (final m in candidatos) {
       if (!vistos.add(m.nombre)) continue; // mismo nombre en Descargas y en la app: se usa uno
       Database? db;
       try {
         db = await openDatabase(m.ruta, readOnly: true, singleInstance: false);
         await db.rawQuery('SELECT 1 FROM tiles LIMIT 1'); // comprueba que sea un MBTiles real
+        final fmt = await _formatoMb(db);
+        if (fmt == 'pbf' || fmt == 'mvt') {
+          await db.close(); // teselas vectoriales: flutter_map raster no las puede dibujar
+          vectoriales.add(m.nombre);
+          continue;
+        }
+        final zr = await db.rawQuery('SELECT MIN(zoom_level) AS a, MAX(zoom_level) AS b FROM tiles');
+        final a = zr.first['a'], b = zr.first['b'];
+        if (a is int) zMin = math.min(zMin, a);
+        if (b is int) zMax = math.max(zMax, b);
+        final lim = await _limitesMb(db);
+        if (lim != null) {
+          if (unionBounds == null) {
+            unionBounds = lim;
+          } else {
+            unionBounds.extend(lim.northEast);
+            unionBounds.extend(lim.southWest);
+          }
+        }
         _basesMb.add(db);
         validos.add(m);
       } catch (_) {
@@ -1605,10 +1783,15 @@ class Controlador extends ChangeNotifier {
       }
     }
     mapas = validos;
+    zoomMinTiles = zMax >= 0 ? zMin : 0;
+    zoomMaxTiles = zMax >= 0 ? zMax : 19;
+    limitesMapa = unionBounds;
     proveedorTiles = ProveedorMbTiles(List<Database>.of(_basesMb));
     versionMapas++;
     notifyListeners();
-    if (invalidos.isNotEmpty) {
+    if (vectoriales.isNotEmpty) {
+      _msg('${vectoriales.join(', ')} es VECTORIAL (pbf). Esta app necesita un .mbtiles raster (png/jpg).');
+    } else if (invalidos.isNotEmpty) {
       _msg('No se pudo abrir como MBTiles: ${invalidos.join(', ')}');
     }
   }
@@ -1639,7 +1822,7 @@ class Controlador extends ChangeNotifier {
       final carpeta = await _carpeta('mapas');
       await File(origen).copy(ruta_p.join(carpeta.path, ruta_p.basename(origen).replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_')));
       await _abrirMapas();
-      _msg('Mapa importado.');
+      if (mapas.isNotEmpty) _msg('Mapa importado.');
     } catch (e) {
       _msg('No se pudo importar el mapa: $e');
     }
@@ -1812,6 +1995,16 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
     }
   }
 
+  /// Encuadra el área que cubren los .mbtiles cargados (por si estás fuera de ella).
+  Future<void> _irAlAreaMapa() async {
+    final b = c.limitesMapa;
+    if (b == null || !_listo) return;
+    setState(() => _seguir = false);
+    try {
+      _mapa.fitCamera(CameraFit.bounds(bounds: b, padding: const EdgeInsets.all(24)));
+    } catch (_) {}
+  }
+
   void _alCambiar() {
     if (!mounted) return;
     final m = c.mensaje;
@@ -1874,6 +2067,8 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                     _aviso('El GPS está apagado.', 'Activar', Geolocator.openLocationSettings),
                   if (c.mapas.isEmpty)
                     _aviso('Sin mapas offline. Copia tu .mbtiles a la carpeta Descargas.', 'Buscar', c.buscarEnDescargas),
+                  if (c.mapas.isNotEmpty && c.fueraDeMapa)
+                    _aviso('Estás fuera del área de tu mapa descargado.', 'Ver mapa', _irAlAreaMapa),
                   if (c.fase == Fase.navegando) _banner(esc),
                 ]),
               ),
@@ -1931,12 +2126,15 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         TileLayer(
           key: ValueKey<int>(c.versionMapas),
           tileProvider: c.proveedorTiles,
-          maxNativeZoom: 19,
+          // Rango real de zoom del .mbtiles: más allá, flutter_map amplía las teselas en vez de dejar blanco
+          minNativeZoom: c.zoomMinTiles,
+          maxNativeZoom: c.zoomMaxTiles,
+          maxZoom: 19,
           errorTileCallback: (tile, error, stack) {},
         ),
         if (r != null)
           PolylineLayer(polylines: [Polyline(points: r.puntos, strokeWidth: 6, color: Colors.blue.shade700)]),
-        MarkerLayer(rotate: true, markers: [  // rotate: los pines no se giran con el mapa
+        MarkerLayer(rotate: true, markers: [ // rotate: los pines no se giran con el mapa
           for (final p in c.pois)
             Marker(
               point: LatLng(p.lat, p.lon),
@@ -1994,7 +2192,11 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
           padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
           child: Row(children: [
             Expanded(child: Text(texto, style: const TextStyle(color: Colors.black87))),
-            TextButton(onPressed: alAccion, child: Text(accion)),
+            TextButton(
+              style: TextButton.styleFrom(foregroundColor: Colors.indigo.shade900),
+              onPressed: alAccion,
+              child: Text(accion, style: const TextStyle(fontWeight: FontWeight.bold)),
+            ),
           ]),
         ),
       );
@@ -2285,7 +2487,7 @@ class PantallaMenu extends StatelessWidget {
           contentPadding: EdgeInsets.zero,
           leading: Icon(m.enDescargas ? Icons.download_done : Icons.folder),
           title: Text(m.nombre, maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text(m.enDescargas ? 'Leído desde Descargas' : 'Importado a la app'),
+          subtitle: Text('${m.enDescargas ? 'Leído desde Descargas' : 'Importado a la app'} · zoom ${c.zoomMinTiles}–${c.zoomMaxTiles}'),
           trailing: m.enDescargas
               ? null
               : IconButton(onPressed: () => c.eliminarMapa(m), icon: const Icon(Icons.delete_outline)),
@@ -2375,7 +2577,6 @@ Future<void> dialogoRuta(BuildContext context, Controlador c) async {
   );
   nombre.dispose();
 }
-
 
 // ============================================================================
 // 12. BRÚJULA (flutter_compass)
