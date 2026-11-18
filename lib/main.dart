@@ -833,7 +833,8 @@ class GuiaVoz {
 /// El modelo en español viaja dentro de los assets de la app (assets/models/...zip): no depende de
 /// Google, no pide descargar idiomas y no necesita red ni servicios del sistema.
 class Escucha {
-  static const String _modeloAsset = 'assets/models/vosk-model-small-es-0.42.zip';
+  static const String _modeloNombre = 'vosk-model-small-es-0.42';
+  static const String _modeloAsset = 'assets/models/$_modeloNombre.zip';
   static const int _frecuencia = 16000;
   static const Duration _tiempoMax = Duration(seconds: 8);
 
@@ -858,9 +859,41 @@ class Escucha {
     return nueva;
   }
 
-  Future<void> _cargar() async {
+  /// Busca el modelo ya descomprimido (carpeta con subcarpeta "am") en Descargas o en la app.
+  /// Sirve de respaldo cuando el .zip no viaja dentro de los assets del APK.
+  Future<String?> _buscarModeloLocal() async {
+    final candidatas = <String>['/storage/emulated/0/Download/$_modeloNombre'];
     try {
-      final ruta = await vosk.ModelLoader().loadFromAssets(_modeloAsset);
+      candidatas.add(ruta_p.join((await getApplicationSupportDirectory()).path, _modeloNombre));
+      candidatas.add(ruta_p.join((await getApplicationDocumentsDirectory()).path, _modeloNombre));
+    } catch (_) {}
+    for (final c in candidatas) {
+      try {
+        if (Directory(ruta_p.join(c, 'am')).existsSync()) return c;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  Future<void> _cargar() async {
+    String? ruta;
+    Object? errorAsset;
+    try {
+      // 1) Modelo empaquetado en la app (assets/models/vosk-model-small-es-0.42.zip)
+      ruta = await vosk.ModelLoader().loadFromAssets(_modeloAsset);
+    } catch (e) {
+      errorAsset = e;
+      // 2) Respaldo: carpeta ya descomprimida en Descargas o en el almacenamiento de la app
+      ruta = await _buscarModeloLocal();
+    }
+    if (ruta == null) {
+      voskListo = false;
+      _carga = null; // permite reintentar
+      estadoModelo = 'Falta el modelo de voz: agrega $_modeloAsset a la app '
+          '(o copia la carpeta $_modeloNombre a Descargas). Detalle: $errorAsset';
+      return;
+    }
+    try {
       final modelo = await _vosk.createModel(ruta);
       _modelo = modelo;
       _reconocedor = await _vosk.createRecognizer(model: modelo, sampleRate: _frecuencia);
@@ -869,7 +902,7 @@ class Escucha {
     } catch (e) {
       voskListo = false;
       _carga = null; // permite reintentar
-      estadoModelo = 'Modelo de voz no disponible (revisa assets/models en pubspec.yaml)';
+      estadoModelo = 'No se pudo iniciar el modelo de voz: $e';
     }
   }
 
@@ -900,7 +933,7 @@ class Escucha {
     await cargarModelo();
     final reconocedor = _reconocedor;
     if (!voskListo || reconocedor == null) {
-      alError('El modelo de voz sin conexión no está disponible en la app.');
+      alError('Falta el modelo de voz sin conexión. Mira Ajustes › Reconocimiento de voz.');
       return;
     }
     try {
