@@ -18,14 +18,6 @@ jobs:
         with:
           flutter-version: '3.27.0'
           cache: true
-
-      - name: Crear plataforma Android solo si no existe
-        run: |
-          if [ ! -d "android" ]; then
-            flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
-          else
-            echo "La plataforma Android ya existe, omitiendo create."
-          fi
       
       - name: Configurar Kotlin 2.1.0, SDK y Permisos con Python
         run: |
