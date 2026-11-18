@@ -22,7 +22,6 @@
 //     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
 //     <queries>
 //         <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
-//         <intent><action android:name="android.speech.RecognitionService"/></intent>
 //     </queries>
 //
 //  B) PAQUETES  →  pubspec.yaml, sección dependencies: (solo paquetes, nunca permisos)
@@ -31,7 +30,7 @@
 //     latlong2: ^0.9.1
 //     geolocator: ^12.0.0
 //     flutter_tts: ^4.0.2
-//     speech_to_text: ^7.0.0
+//     vosk_flutter: ^0.3.48
 //     sqflite: ^2.3.3+1
 //     path: ^1.9.0
 //     path_provider: ^2.1.4
@@ -40,7 +39,13 @@
 //     wakelock_plus: ^1.2.8
 //     flutter_compass: ^0.8.1
 //
-//  C) En tiempo de ejecución la app pide los permisos sola (ubicación, notificaciones,
+//  C) MODELO DE VOZ OFFLINE (Vosk)  →  pubspec.yaml, sección flutter: (el .zip va SIN descomprimir)
+//
+//     flutter:
+//       assets:
+//         - assets/models/vosk-model-small-es-0.42.zip
+//
+//  D) En tiempo de ejecución la app pide los permisos sola (ubicación, notificaciones,
 //     micrófono y acceso a Descargas): ver Controlador.pedirPermisos().
 // ----------------------------------------------------------------------------
 import 'dart:async';
@@ -63,8 +68,6 @@ import 'package:latlong2/latlong.dart';
 import 'package:path/path.dart' as ruta_p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:speech_to_text/speech_recognition_error.dart';
-import 'package:speech_to_text/speech_to_text.dart';
 import 'package:vosk_flutter/vosk_flutter.dart' as vosk;
 import 'package:sqflite/sqflite.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -826,123 +829,15 @@ class GuiaVoz {
   }
 }
 
-/// Reconocimiento de voz para comandos manos libres.
-/// 1) Intenta primero SIN conexión (paquete de voz en español descargado en el teléfono).
-/// 2) Si el teléfono no tiene el paquete (error_language_not_supported), reintenta UNA vez con el
-///    reconocedor normal de Google (necesita internet) en lugar de quedarse con el error.
-/// 3) Si tampoco se puede, explica exactamente cómo descargar el paquete sin conexión.
-class _EscuchaGoogle {
-  final SpeechToText _stt = SpeechToText();
-  bool _init = false;
-  bool _soloOnDevice = true;
-  bool _yaReintento = false;
-  String? _idioma;
-  void Function(bool)? _alEstado;
-  void Function(String)? _alError;
-  void Function(String)? _alResultado;
-
-  Future<void> escuchar({
-    required void Function(String) alResultado,
-    required void Function(String) alError,
-    required void Function(bool) alEstado,
-  }) async {
-    _alResultado = alResultado;
-    _alError = alError;
-    _alEstado = alEstado;
-    _soloOnDevice = true;
-    _yaReintento = false;
-    if (!_init) {
-      _init = await _stt.initialize(
-        onStatus: (s) {
-          if (s == 'done' || s == 'notListening') _alEstado?.call(false);
-        },
-        onError: _alFallar,
-      );
-    }
-    if (!_init) {
-      alError('Reconocimiento de voz no disponible o permiso de micrófono negado.');
-      return;
-    }
-    _idioma = await _elegirIdioma();
-    await _iniciar();
-  }
-
-  Future<String?> _elegirIdioma() async {
-    String? es;
-    for (final l in await _stt.locales()) {
-      final id = l.localeId.replaceAll('-', '_');
-      if (id == 'es_MX') return l.localeId;
-      if (id.startsWith('es') && es == null) es = l.localeId;
-    }
-    return es; // null = idioma del sistema
-  }
-
-  Future<void> _iniciar() async {
-    try {
-      await _stt.cancel();
-    } catch (_) {}
-    _alEstado?.call(true);
-    await _stt.listen(
-      onResult: (r) {
-        if (!r.finalResult) return;
-        _alEstado?.call(false);
-        final t = r.recognizedWords.trim();
-        if (t.isEmpty) {
-          _alError?.call('No te escuché, intenta de nuevo.');
-        } else {
-          _alResultado?.call(t);
-        }
-      },
-      localeId: _idioma,
-      listenFor: const Duration(seconds: 8),
-      pauseFor: const Duration(seconds: 3),
-      listenOptions: SpeechListenOptions(onDevice: _soloOnDevice, partialResults: false, cancelOnError: true),
-    );
-  }
-
-  void _alFallar(SpeechRecognitionError e) {
-    final sinIdioma = e.errorMsg == 'error_language_not_supported' || e.errorMsg == 'error_language_unavailable';
-    if (sinIdioma && _soloOnDevice && !_yaReintento) {
-      _yaReintento = true;
-      _soloOnDevice = false; // reintenta con el reconocedor normal de Google
-      Future<void>.delayed(const Duration(milliseconds: 300), _iniciar);
-      return;
-    }
-    _alEstado?.call(false);
-    _alError?.call(_mensaje(e.errorMsg));
-  }
-
-  String _mensaje(String e) {
-    switch (e) {
-      case 'error_language_not_supported':
-      case 'error_language_unavailable':
-        return 'Falta el español sin conexión. Descárgalo en: app Google → tu foto → Configuración → '
-            'Voz → Reconocimiento de voz sin conexión → Español (México).';
-      case 'error_permission':
-        return 'Concede el permiso de micrófono a la app.';
-      case 'error_no_match':
-      case 'error_speech_timeout':
-        return 'No te escuché, intenta de nuevo.';
-      case 'error_network':
-      case 'error_network_timeout':
-      case 'error_server':
-        return 'Sin internet y sin paquete de voz offline. Descarga el español sin conexión (app Google → Voz).';
-      case 'error_busy':
-        return 'El reconocedor está ocupado, intenta de nuevo.';
-      default:
-        return 'Voz: $e';
-    }
-  }
-
-  Future<void> cancelar() => _stt.cancel();
-}
-
-/// Reconocimiento de voz SIN INTERNET integrado en la app (Vosk + modelo en español dentro del APK).
-/// Si el modelo no se pudiera cargar, usa el reconocedor de Google como respaldo.
+/// Reconocimiento de voz 100 % SIN INTERNET con Vosk (paquete vosk_flutter).
+/// El modelo en español viaja dentro de los assets de la app (assets/models/...zip): no depende de
+/// Google, no pide descargar idiomas y no necesita red ni servicios del sistema.
 class Escucha {
   static const String _modeloAsset = 'assets/models/vosk-model-small-es-0.42.zip';
+  static const int _frecuencia = 16000;
+  static const Duration _tiempoMax = Duration(seconds: 8);
+
   final vosk.VoskFlutterPlugin _vosk = vosk.VoskFlutterPlugin.instance();
-  final _EscuchaGoogle _google = _EscuchaGoogle();
   vosk.Model? _modelo;
   vosk.Recognizer? _reconocedor;
   vosk.SpeechService? _servicio;
@@ -950,23 +845,31 @@ class Escucha {
   Timer? _limite;
   Future<void>? _carga;
   bool voskListo = false;
-  bool _usandoVosk = false;
+  bool _activo = false;
   String estadoModelo = 'Cargando modelo de voz…';
 
-  /// Carga el modelo una sola vez (la primera vez descomprime ~40 MB, tarda unos segundos).
-  Future<void> cargarModelo() => _carga ??= _cargar();
+  /// Carga el modelo una sola vez (la primera vez descomprime el .zip, tarda unos segundos).
+  /// Si falla, la siguiente llamada vuelve a intentarlo.
+  Future<void> cargarModelo() {
+    final actual = _carga;
+    if (actual != null) return actual;
+    final nueva = _cargar();
+    _carga = nueva;
+    return nueva;
+  }
 
   Future<void> _cargar() async {
     try {
       final ruta = await vosk.ModelLoader().loadFromAssets(_modeloAsset);
       final modelo = await _vosk.createModel(ruta);
       _modelo = modelo;
-      _reconocedor = await _vosk.createRecognizer(model: modelo, sampleRate: 16000);
+      _reconocedor = await _vosk.createRecognizer(model: modelo, sampleRate: _frecuencia);
       voskListo = true;
       estadoModelo = 'Vosk español (sin conexión) listo';
     } catch (e) {
       voskListo = false;
-      estadoModelo = 'Vosk no disponible: se usa el reconocedor de Google';
+      _carga = null; // permite reintentar
+      estadoModelo = 'Modelo de voz no disponible (revisa assets/models en pubspec.yaml)';
     }
   }
 
@@ -982,7 +885,7 @@ class Escucha {
   Future<void> _terminar(void Function(bool) alEstado) async {
     _limite?.cancel();
     _limite = null;
-    _usandoVosk = false;
+    _activo = false;
     alEstado(false);
     try {
       await _servicio?.stop();
@@ -995,11 +898,13 @@ class Escucha {
     required void Function(bool) alEstado,
   }) async {
     await cargarModelo();
-    if (!voskListo || _reconocedor == null) {
-      return _google.escuchar(alResultado: alResultado, alError: alError, alEstado: alEstado);
+    final reconocedor = _reconocedor;
+    if (!voskListo || reconocedor == null) {
+      alError('El modelo de voz sin conexión no está disponible en la app.');
+      return;
     }
     try {
-      final servicio = _servicio ??= await _vosk.initSpeechService(_reconocedor!);
+      final servicio = _servicio ??= await _vosk.initSpeechService(reconocedor);
       await _subResultado?.cancel();
       var entregado = false;
       _subResultado = servicio.onResult().listen((r) {
@@ -1011,10 +916,10 @@ class Escucha {
         alResultado(t);
       });
       alEstado(true);
-      _usandoVosk = true;
+      _activo = true;
       await servicio.start();
       _limite?.cancel();
-      _limite = Timer(const Duration(seconds: 8), () {
+      _limite = Timer(_tiempoMax, () {
         if (entregado) return;
         entregado = true;
         _terminar(alEstado);
@@ -1029,13 +934,14 @@ class Escucha {
   Future<void> cancelar() async {
     _limite?.cancel();
     _limite = null;
-    if (_usandoVosk) {
-      _usandoVosk = false;
+    await _subResultado?.cancel();
+    _subResultado = null;
+    if (_activo) {
+      _activo = false;
       try {
         await _servicio?.stop();
       } catch (_) {}
     }
-    await _google.cancelar();
   }
 }
 
