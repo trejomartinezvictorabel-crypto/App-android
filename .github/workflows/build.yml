@@ -19,15 +19,9 @@ jobs:
           flutter-version: '3.27.0'
           cache: true
 
-      - name: Generar plataforma Android base
-        run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
-      
-      - name: Parchear Gradle, pubspec, Kotlin y Permisos con Python
+      - name: 1. Crear pubspec.yaml correcto y prevenir errores
         run: |
           python3 -c "
-          import os
-
-          # 1. Asegurar un pubspec.yaml válido con todas las dependencias
           pubspec_content = '''name: navegacion_offline_mx
           description: Navegación multimodal offline para trabajo de campo en México.
           publish_to: \"none\"
@@ -62,8 +56,17 @@ jobs:
           '''
           with open('pubspec.yaml', 'w') as f:
               f.write(pubspec_content)
+          "
 
-          # 2. Actualizar Gradle Wrapper a la versión 8.10.2 (compatible con Flutter 3.27)
+      - name: 2. Generar plataforma Android base
+        run: flutter create . --org com.albanil.app --project-name navegacion_offline_mx --platforms=android
+      
+      - name: 3. Parchear Gradle, Kotlin y Permisos con Python
+        run: |
+          python3 -c "
+          import os
+
+          # Actualizar Gradle Wrapper a la versión 8.10.2
           wrapper_path = 'android/gradle/wrapper/gradle-wrapper.properties'
           if os.path.exists(wrapper_path):
               with open(wrapper_path, 'r') as f:
@@ -72,7 +75,7 @@ jobs:
               with open(wrapper_path, 'w') as f:
                   f.write(new_wrapper)
 
-          # 3. Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
+          # Actualizar la versión de Kotlin a 2.1.0 en android/settings.gradle
           settings_path = 'android/settings.gradle'
           if os.path.exists(settings_path):
               with open(settings_path, 'r') as f:
@@ -88,7 +91,7 @@ jobs:
               with open(settings_path, 'w') as f:
                   f.writelines(new_settings)
 
-          # 4. Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
+          # Forzar SDK 36 y MinSDK 24 en android/app/build.gradle
           gradle_path = 'android/app/build.gradle'
           if os.path.exists(gradle_path):
               with open(gradle_path, 'r') as f:
@@ -114,7 +117,7 @@ jobs:
               with open(gradle_path, 'w') as f:
                   f.writelines(new_lines)
 
-          # 5. Agregar permisos en AndroidManifest.xml
+          # Agregar permisos en AndroidManifest.xml
           manifest_path = 'android/app/src/main/AndroidManifest.xml'
           if os.path.exists(manifest_path):
               with open(manifest_path, 'r') as f:
