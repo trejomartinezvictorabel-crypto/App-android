@@ -38,6 +38,7 @@ jobs:
             geolocator: ^12.0.0
             flutter_tts: ^4.0.2
             speech_to_text: ^7.0.0
+            vosk_flutter: ^0.3.48
             sqflite: ^2.3.3+1
             path: ^1.9.0
             path_provider: ^2.1.4
@@ -53,6 +54,8 @@ jobs:
 
           flutter:
             uses-material-design: true
+            assets:
+              - assets/models/
           '''
           with open('pubspec.yaml', 'w') as f:
               f.write(pubspec_content)
@@ -145,6 +148,36 @@ jobs:
                       f.write(manifest)
           "
 
+      - name: 4. Parche de namespace para plugins antiguos (vosk_flutter)
+        run: |
+          python3 - <<'PY'
+          ruta = 'android/build.gradle'
+          s = open(ruta, encoding='utf-8').read()
+          parche = """subprojects {
+              afterEvaluate { p ->
+                  def ext = p.extensions.findByName('android')
+                  if (ext != null && ext.namespace == null) {
+                      def mf = new File(p.projectDir, 'src/main/AndroidManifest.xml')
+                      if (mf.exists()) {
+                          def pkg = new XmlSlurper().parse(mf).attributes()['package']
+                          if (pkg) { ext.namespace = pkg }
+                      }
+                  }
+              }
+          }
+
+          """
+          if "ext.namespace == null" not in s and 'subprojects {' in s:
+              s = s.replace('subprojects {', parche + 'subprojects {', 1)
+              open(ruta, 'w', encoding='utf-8').write(s)
+          print(s)
+          PY
+
+      - name: 5. Descargar modelo de voz en español (Vosk) e integrarlo en la app
+        run: |
+          mkdir -p assets/models
+          curl -L --fail -o assets/models/vosk-model-small-es-0.42.zip https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip
+          ls -lh assets/models
       - run: flutter pub get
       - run: flutter build apk --debug
       - uses: actions/upload-artifact@v4
