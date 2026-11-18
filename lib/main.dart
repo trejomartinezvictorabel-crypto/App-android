@@ -65,6 +65,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart';
+import 'package:vosk_flutter/vosk_flutter.dart' as vosk;
 import 'package:sqflite/sqflite.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -781,6 +782,9 @@ class GuiaVoz {
 
   Future<void> iniciar() async {
     try {
+      try {
+        await _tts.setEngine('com.google.android.tts'); // solo el sintetizador de voz de Google
+      } catch (_) {}
       final okMx = await _tts.isLanguageAvailable('es-MX');
       if (okMx == true || okMx == 1) {
         await _tts.setLanguage('es-MX');
@@ -827,7 +831,7 @@ class GuiaVoz {
 /// 2) Si el teléfono no tiene el paquete (error_language_not_supported), reintenta UNA vez con el
 ///    reconocedor normal de Google (necesita internet) en lugar de quedarse con el error.
 /// 3) Si tampoco se puede, explica exactamente cómo descargar el paquete sin conexión.
-class Escucha {
+class _EscuchaGoogle {
   final SpeechToText _stt = SpeechToText();
   bool _init = false;
   bool _soloOnDevice = true;
@@ -931,6 +935,108 @@ class Escucha {
   }
 
   Future<void> cancelar() => _stt.cancel();
+}
+
+/// Reconocimiento de voz SIN INTERNET integrado en la app (Vosk + modelo en español dentro del APK).
+/// Si el modelo no se pudiera cargar, usa el reconocedor de Google como respaldo.
+class Escucha {
+  static const String _modeloAsset = 'assets/models/vosk-model-small-es-0.42.zip';
+  final vosk.VoskFlutterPlugin _vosk = vosk.VoskFlutterPlugin.instance();
+  final _EscuchaGoogle _google = _EscuchaGoogle();
+  vosk.Model? _modelo;
+  vosk.Recognizer? _reconocedor;
+  vosk.SpeechService? _servicio;
+  StreamSubscription<String>? _subResultado;
+  Timer? _limite;
+  Future<void>? _carga;
+  bool voskListo = false;
+  bool _usandoVosk = false;
+  String estadoModelo = 'Cargando modelo de voz…';
+
+  /// Carga el modelo una sola vez (la primera vez descomprime ~40 MB, tarda unos segundos).
+  Future<void> cargarModelo() => _carga ??= _cargar();
+
+  Future<void> _cargar() async {
+    try {
+      final ruta = await vosk.ModelLoader().loadFromAssets(_modeloAsset);
+      final modelo = await _vosk.createModel(ruta);
+      _modelo = modelo;
+      _reconocedor = await _vosk.createRecognizer(model: modelo, sampleRate: 16000);
+      voskListo = true;
+      estadoModelo = 'Vosk español (sin conexión) listo';
+    } catch (e) {
+      voskListo = false;
+      estadoModelo = 'Vosk no disponible: se usa el reconocedor de Google';
+    }
+  }
+
+  String _texto(String json) {
+    try {
+      final m = jsonDecode(json);
+      return m is Map ? '${m['text'] ?? ''}'.trim() : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> _terminar(void Function(bool) alEstado) async {
+    _limite?.cancel();
+    _limite = null;
+    _usandoVosk = false;
+    alEstado(false);
+    try {
+      await _servicio?.stop();
+    } catch (_) {}
+  }
+
+  Future<void> escuchar({
+    required void Function(String) alResultado,
+    required void Function(String) alError,
+    required void Function(bool) alEstado,
+  }) async {
+    await cargarModelo();
+    if (!voskListo || _reconocedor == null) {
+      return _google.escuchar(alResultado: alResultado, alError: alError, alEstado: alEstado);
+    }
+    try {
+      final servicio = _servicio ??= await _vosk.initSpeechService(_reconocedor!);
+      await _subResultado?.cancel();
+      var entregado = false;
+      _subResultado = servicio.onResult().listen((r) {
+        if (entregado) return;
+        final t = _texto(r);
+        if (t.isEmpty) return;
+        entregado = true;
+        _terminar(alEstado);
+        alResultado(t);
+      });
+      alEstado(true);
+      _usandoVosk = true;
+      await servicio.start();
+      _limite?.cancel();
+      _limite = Timer(const Duration(seconds: 8), () {
+        if (entregado) return;
+        entregado = true;
+        _terminar(alEstado);
+        alError('No te escuché, intenta de nuevo.');
+      });
+    } catch (e) {
+      await _terminar(alEstado);
+      alError('Voz: $e');
+    }
+  }
+
+  Future<void> cancelar() async {
+    _limite?.cancel();
+    _limite = null;
+    if (_usandoVosk) {
+      _usandoVosk = false;
+      try {
+        await _servicio?.stop();
+      } catch (_) {}
+    }
+    await _google.cancelar();
+  }
 }
 
 // ---- Comandos de voz ----
@@ -1176,6 +1282,7 @@ class Controlador extends ChangeNotifier {
     await datos.abrir();
     await _recargar();
     await voz.iniciar();
+    unawaited(stt.cargarModelo().then((_) => notifyListeners())); // modelo de voz en segundo plano
     await _abrirMapas();
     await _cargarRedGuardada();
     await iniciarGps(); // ubicación (diálogo del sistema)
@@ -2523,6 +2630,7 @@ class PantallaMenu extends StatelessWidget {
         value: c.vozActiva,
         onChanged: c.establecerVoz,
       ),
+      Text('Reconocimiento de voz: ${c.stt.estadoModelo}', style: const TextStyle(fontSize: 12)),
       const Divider(),
       const Text('Permisos', style: TextStyle(fontWeight: FontWeight.bold)),
       const SizedBox(height: 8),
@@ -2738,3 +2846,4 @@ class _PintorDial extends CustomPainter {
   @override
   bool shouldRepaint(covariant _PintorDial o) => o.color != color || o.norte != norte;
 }
+
