@@ -2,7 +2,8 @@
 //  NAVEGACIÓN MULTIMODAL OFFLINE — MÉXICO (Flutter, un solo main.dart)
 //  GPS en tiempo real · mapas MBTiles locales · enrutamiento A* sobre GeoJSON
 //  Voz (TTS/STT) manos libres · SQLite local (POIs, rutas frecuentes, historial)
-//  Sin internet en tiempo de ejecución. Requiere Dart >= 3.0.
+//  Navega SIN internet; internet solo se usa al descargar mapas / red vial (Ajustes).
+//  Requiere Dart >= 3.0.
 // ============================================================================
 // ----------------------------------------------------------------------------
 //  CONFIGURACIÓN COMPLETA (Flutter exige que viva fuera de este archivo;
@@ -11,6 +12,7 @@
 //  A) PERMISOS  →  android/app/src/main/AndroidManifest.xml
 //     (NO van en pubspec.yaml). Entre <manifest> y <application>:
 //
+//     <uses-permission android:name="android.permission.INTERNET"/>   ← NUEVO: necesario para las descargas
 //     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
 //     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
 //     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
@@ -38,6 +40,8 @@
 //     permission_handler: ^11.3.1
 //     wakelock_plus: ^1.2.8
 //     flutter_compass: ^0.8.1
+//
+//     (Las descargas NO agregan paquetes nuevos: usan dart:io, sqflite y path_provider, que ya están.)
 //
 //  C) MODELO DE VOZ OFFLINE (Vosk)  →  pubspec.yaml, sección flutter: (el .zip va SIN descomprimir)
 //
@@ -504,15 +508,84 @@ void _recorrerLineas(dynamic c, void Function(List<dynamic>) alLinea) {
   }
 }
 
-/// Construye el grafo desde un GeoJSON de OSM. Se ejecuta en un isolate (no congela la UI).
-RedVial construirRed(String rutaArchivo) {
-  final datos = jsonDecode(File(rutaArchivo).readAsStringSync());
-  final features = datos is Map ? datos['features'] : datos;
+// Listas crecientes sobre arreglos tipados: ocupan ~4 veces menos memoria que List<double>/List<int>
+// (importante para redes viales de un estado completo en equipos de 4 GB).
+class _ListaI32 {
+  Int32List _d = Int32List(4096);
+  int length = 0;
+  void add(int v) {
+    if (length == _d.length) {
+      final n = Int32List(_d.length * 2)..setRange(0, length, _d);
+      _d = n;
+    }
+    _d[length++] = v;
+  }
 
+  int operator [](int i) => _d[i];
+}
+
+class _ListaU8 {
+  Uint8List _d = Uint8List(4096);
+  int length = 0;
+  void add(int v) {
+    if (length == _d.length) {
+      final n = Uint8List(_d.length * 2)..setRange(0, length, _d);
+      _d = n;
+    }
+    _d[length++] = v;
+  }
+
+  int operator [](int i) => _d[i];
+}
+
+class _ListaF32 {
+  Float32List _d = Float32List(4096);
+  int length = 0;
+  void add(double v) {
+    if (length == _d.length) {
+      final n = Float32List(_d.length * 2)..setRange(0, length, _d);
+      _d = n;
+    }
+    _d[length++] = v;
+  }
+
+  double operator [](int i) => _d[i];
+}
+
+class _ListaF64 {
+  Float64List _d = Float64List(4096);
+  int length = 0;
+  void add(double v) {
+    if (length == _d.length) {
+      final n = Float64List(_d.length * 2)..setRange(0, length, _d);
+      _d = n;
+    }
+    _d[length++] = v;
+  }
+
+  Float64List recortar() => _d.sublist(0, length);
+}
+
+/// ¿El archivo lo generó esta app (una vía por línea)? Entonces se puede leer en flujo.
+Future<bool> _esGeoJsonPorLineas(File f) async {
+  final raf = await f.open();
+  try {
+    final b = await raf.read(_cabeceraGeoJson.length + 1);
+    return String.fromCharCodes(b) == '$_cabeceraGeoJson\n';
+  } finally {
+    await raf.close();
+  }
+}
+
+/// Construye el grafo desde uno o varios GeoJSON de OSM. Se ejecuta en un isolate (no congela la UI).
+/// Los archivos descargados por la app se leen línea por línea (poca memoria); cualquier otro
+/// GeoJSON (p. ej. importado a mano) se carga completo, como antes.
+Future<RedVial> construirRed(List<String> rutas) async {
   final claveANodo = <int, int>{};
-  final lats = <double>[], lons = <double>[];
-  final ef = <int>[], et = <int>[], ec = <int>[], ek = <int>[];
-  final ed = <double>[];
+  final lats = _ListaF64(), lons = _ListaF64();
+  final ef = _ListaI32(), et = _ListaI32();
+  final ec = _ListaU8(), ek = _ListaU8();
+  final ed = _ListaF32();
 
   int nodo(double lat, double lon) {
     final k = ((lat * 1e6).round() + 90000000) * 400000000 + ((lon * 1e6).round() + 180000000);
@@ -533,55 +606,78 @@ RedVial construirRed(String rutaArchivo) {
     ek.add(contra ? 1 : 0);
   }
 
-  if (features is List) {
-    for (final f in features) {
-      if (f is! Map) continue;
-      final props = f['properties'];
-      final geom = f['geometry'];
-      if (props is! Map || geom is! Map) continue;
-      final claseVia = claseDesdeOsm(props['highway']?.toString());
-      if (claseVia == null) continue;
-      final ow = props['oneway']?.toString();
-      final junc = props['junction']?.toString();
-      // 0 = ambos sentidos, 1 = adelante, 2 = atrás
-      final int sentido = (ow == 'yes' || ow == 'true' || ow == '1' || (ow == null && junc == 'roundabout'))
-          ? 1
-          : (ow == '-1' || ow == 'reverse')
-              ? 2
-              : 0;
-      _recorrerLineas(geom['coordinates'], (linea) {
-        for (var i = 0; i < linea.length - 1; i++) {
-          final a = linea[i], b = linea[i + 1];
-          if (a is! List || b is! List || a.length < 2 || b.length < 2) continue;
-          final lonA = (a[0] as num).toDouble(), latA = (a[1] as num).toDouble();
-          final lonB = (b[0] as num).toDouble(), latB = (b[1] as num).toDouble();
-          final ia = nodo(latA, lonA), ib = nodo(latB, lonB);
-          if (ia == ib) continue;
-          final d = Geo.dist(latA, lonA, latB, lonB);
-          final ci = claseVia.index;
-          if (sentido == 0) {
-            arista(ia, ib, d, ci, false);
-            arista(ib, ia, d, ci, false);
-          } else if (sentido == 1) {
-            arista(ia, ib, d, ci, false);
-            arista(ib, ia, d, ci, true);
-          } else {
-            arista(ib, ia, d, ci, false);
-            arista(ia, ib, d, ci, true);
-          }
+  void procesar(dynamic f) {
+    if (f is! Map) return;
+    final props = f['properties'];
+    final geom = f['geometry'];
+    if (props is! Map || geom is! Map) return;
+    final claseVia = claseDesdeOsm(props['highway']?.toString());
+    if (claseVia == null) return;
+    final ow = props['oneway']?.toString();
+    final junc = props['junction']?.toString();
+    // 0 = ambos sentidos, 1 = adelante, 2 = atrás
+    final int sentido = (ow == 'yes' || ow == 'true' || ow == '1' || (ow == null && junc == 'roundabout'))
+        ? 1
+        : (ow == '-1' || ow == 'reverse')
+            ? 2
+            : 0;
+    _recorrerLineas(geom['coordinates'], (linea) {
+      for (var i = 0; i < linea.length - 1; i++) {
+        final a = linea[i], b = linea[i + 1];
+        if (a is! List || b is! List || a.length < 2 || b.length < 2) continue;
+        final lonA = (a[0] as num).toDouble(), latA = (a[1] as num).toDouble();
+        final lonB = (b[0] as num).toDouble(), latB = (b[1] as num).toDouble();
+        final ia = nodo(latA, lonA), ib = nodo(latB, lonB);
+        if (ia == ib) continue;
+        final d = Geo.dist(latA, lonA, latB, lonB);
+        final ci = claseVia.index;
+        if (sentido == 0) {
+          arista(ia, ib, d, ci, false);
+          arista(ib, ia, d, ci, false);
+        } else if (sentido == 1) {
+          arista(ia, ib, d, ci, false);
+          arista(ib, ia, d, ci, true);
+        } else {
+          arista(ib, ia, d, ci, false);
+          arista(ia, ib, d, ci, true);
         }
-      });
+      }
+    });
+  }
+
+  for (final ruta in rutas) {
+    final archivo = File(ruta);
+    if (await _esGeoJsonPorLineas(archivo)) {
+      final lineas = archivo.openRead().transform(utf8.decoder).transform(const LineSplitter());
+      await for (final linea in lineas) {
+        var t = linea.trim();
+        if (t.startsWith(',')) t = t.substring(1);
+        if (!t.startsWith('{"type":"Feature"')) continue;
+        try {
+          procesar(jsonDecode(t));
+        } on FormatException {
+          continue;
+        }
+      }
+    } else {
+      final datos = jsonDecode(await archivo.readAsString());
+      final features = datos is Map ? datos['features'] : datos;
+      if (features is List) {
+        for (final f in features) {
+          procesar(f);
+        }
+      }
     }
   }
-  if (ef.isEmpty) {
+  if (ef.length == 0) {
     throw Exception("El archivo no contiene vías (LineString con propiedad 'highway').");
   }
 
   // Compactar a CSR
   final n = lats.length, m = ef.length;
   final offs = Int32List(n + 1);
-  for (final a in ef) {
-    offs[a + 1]++;
+  for (var e = 0; e < m; e++) {
+    offs[ef[e] + 1]++;
   }
   for (var i = 0; i < n; i++) {
     offs[i + 1] += offs[i];
@@ -598,7 +694,7 @@ RedVial construirRed(String rutaArchivo) {
     clase[q] = ec[e];
     contra[q] = ek[e];
   }
-  return RedVial(Float64List.fromList(lats), Float64List.fromList(lons), offs, dest, dist, clase, contra);
+  return RedVial(lats.recortar(), lons.recortar(), offs, dest, dist, clase, contra);
 }
 
 /// Motor de enrutamiento local: A* con red vial cargada; línea recta como respaldo.
@@ -606,8 +702,8 @@ class MotorRutas {
   RedVial? red;
   static const double _maxAjusteM = 3000;
 
-  Future<int> cargar(String rutaArchivo) async {
-    final nueva = await Isolate.run(() => construirRed(rutaArchivo));
+  Future<int> cargar(List<String> rutas) async {
+    final nueva = await Isolate.run(() => construirRed(rutas));
     red = nueva;
     return nueva.nodos;
   }
@@ -1138,6 +1234,570 @@ class ProveedorMbTiles extends TileProvider {
 }
 
 // ============================================================================
+// 7B. DESCARGA DE MAPAS Y RED VIAL (Overpass · Nominatim · servidor de teselas)
+// ============================================================================
+//
+//  Fuentes PÚBLICAS (la app solo necesita internet mientras descarga):
+//   · Red vial ....... Overpass API (datos de OpenStreetMap, licencia ODbL).
+//   · Municipios ..... Nominatim (buscador de OpenStreetMap).
+//   · Mapas raster ... el servidor de teselas XYZ que el usuario indique (ver panel de Ajustes).
+//  Todo se guarda en el almacenamiento de la app y después funciona SIN internet.
+
+const String _agenteHttp = 'NavegacionOfflineMX/1.0 (app de campo; descarga bajo demanda)';
+
+/// Primera línea de los GeoJSON que genera la app (una vía por línea → lectura en flujo).
+const String _cabeceraGeoJson = '{"type":"FeatureCollection","features":[';
+
+class ErrorDescarga implements Exception {
+  final String mensaje;
+  const ErrorDescarga(this.mensaje);
+  @override
+  String toString() => mensaje;
+}
+
+class _ErrorHttp implements Exception {
+  final int codigo;
+  const _ErrorHttp(this.codigo);
+}
+
+// ---------------------------------------------------------------- catálogo
+class EstadoMx {
+  final String nombre, iso;
+  const EstadoMx(this.nombre, this.iso);
+}
+
+/// Los 32 estados con su código ISO 3166-2 (así se identifican en OpenStreetMap).
+const List<EstadoMx> estadosMx = [
+  EstadoMx('Aguascalientes', 'MX-AGU'),
+  EstadoMx('Baja California', 'MX-BCN'),
+  EstadoMx('Baja California Sur', 'MX-BCS'),
+  EstadoMx('Campeche', 'MX-CAM'),
+  EstadoMx('Chiapas', 'MX-CHP'),
+  EstadoMx('Chihuahua', 'MX-CHH'),
+  EstadoMx('Ciudad de México', 'MX-CMX'),
+  EstadoMx('Coahuila', 'MX-COA'),
+  EstadoMx('Colima', 'MX-COL'),
+  EstadoMx('Durango', 'MX-DUR'),
+  EstadoMx('Guanajuato', 'MX-GUA'),
+  EstadoMx('Guerrero', 'MX-GRO'),
+  EstadoMx('Hidalgo', 'MX-HID'),
+  EstadoMx('Jalisco', 'MX-JAL'),
+  EstadoMx('México (Edo. de)', 'MX-MEX'),
+  EstadoMx('Michoacán', 'MX-MIC'),
+  EstadoMx('Morelos', 'MX-MOR'),
+  EstadoMx('Nayarit', 'MX-NAY'),
+  EstadoMx('Nuevo León', 'MX-NLE'),
+  EstadoMx('Oaxaca', 'MX-OAX'),
+  EstadoMx('Puebla', 'MX-PUE'),
+  EstadoMx('Querétaro', 'MX-QUE'),
+  EstadoMx('Quintana Roo', 'MX-ROO'),
+  EstadoMx('San Luis Potosí', 'MX-SLP'),
+  EstadoMx('Sinaloa', 'MX-SIN'),
+  EstadoMx('Sonora', 'MX-SON'),
+  EstadoMx('Tabasco', 'MX-TAB'),
+  EstadoMx('Tamaulipas', 'MX-TAM'),
+  EstadoMx('Tlaxcala', 'MX-TLA'),
+  EstadoMx('Veracruz', 'MX-VER'),
+  EstadoMx('Yucatán', 'MX-YUC'),
+  EstadoMx('Zacatecas', 'MX-ZAC'),
+];
+
+enum Alcance { pais, estado, municipio }
+
+/// Cuánto detalle vial se descarga (a más detalle, archivo más grande).
+enum Detalle {
+  troncal('Solo carreteras principales',
+      'motorway|motorway_link|trunk|trunk_link|primary|primary_link'),
+  principal('Principal (+ secundarias y terciarias)',
+      'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link'),
+  estandar('Estándar (+ calles, brechas y terracerías)',
+      'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|'
+          'unclassified|residential|living_street|track'),
+  completo('Completo (+ servicio, veredas, ciclovías y peatonal)',
+      'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|'
+          'unclassified|residential|living_street|track|service|footway|pedestrian|steps|path|cycleway|bridleway');
+
+  const Detalle(this.etiqueta, this.filtro);
+  final String etiqueta;
+  final String filtro; // valores de la etiqueta "highway" de OSM
+}
+
+/// Zona geográfica: relación administrativa de OSM + su rectángulo envolvente.
+class Zona {
+  final String nombre;
+  final int relId;
+  final double sur, oeste, norte, este;
+  const Zona(this.nombre, this.relId, this.sur, this.oeste, this.norte, this.este);
+  int get areaId => 3600000000 + relId; // id de "área" en Overpass
+}
+
+/// Rectángulo aproximado de México (solo para teselas; no se usa en consultas Overpass).
+const Zona zonaMexico = Zona('México', 114686, 14.3, -118.7, 32.8, -86.6);
+
+// ---------------------------------------------------------------- HTTP
+class ClienteHttp {
+  static final HttpClient _cliente = HttpClient()
+    ..userAgent = _agenteHttp
+    ..connectionTimeout = const Duration(seconds: 20);
+
+  /// Descarga el cuerpo completo. Con [cuerpo] hace POST de formulario; sin él, GET.
+  static Future<Uint8List> bytes(Uri url, {String? cuerpo, Duration limite = const Duration(seconds: 240)}) async {
+    final req = await (cuerpo == null ? _cliente.getUrl(url) : _cliente.postUrl(url)).timeout(const Duration(seconds: 30));
+    req.headers.set(HttpHeaders.acceptLanguageHeader, 'es');
+    if (cuerpo != null) {
+      req.headers.contentType = ContentType('application', 'x-www-form-urlencoded', charset: 'utf-8');
+      final cb = utf8.encode(cuerpo);
+      req.contentLength = cb.length;
+      req.add(cb);
+    }
+    final resp = await req.close().timeout(limite);
+    if (resp.statusCode != 200) {
+      await resp.drain<void>();
+      throw _ErrorHttp(resp.statusCode);
+    }
+    final acumulado = BytesBuilder(copy: false);
+    await for (final parte in resp.timeout(limite)) {
+      acumulado.add(parte);
+    }
+    return acumulado.takeBytes();
+  }
+}
+
+// ---------------------------------------------------------------- Overpass
+class Overpass {
+  static const List<String> _servidores = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  ];
+  int _turno = 0;
+
+  /// Ejecuta una consulta Overpass QL. Reintenta y rota de servidor si hay saturación o fallas.
+  Future<Map<String, dynamic>> consultar(String ql, bool Function() cancelado) async {
+    String ultimo = 'sin detalle';
+    for (var intento = 0; intento < 6; intento++) {
+      if (cancelado()) throw const ErrorDescarga('Descarga cancelada.');
+      final url = Uri.parse(_servidores[_turno % _servidores.length]);
+      try {
+        final datos = await ClienteHttp.bytes(url, cuerpo: 'data=${Uri.encodeQueryComponent(ql)}');
+        final j = jsonDecode(utf8.decode(datos));
+        if (j is Map<String, dynamic>) {
+          final remark = '${j['remark'] ?? ''}';
+          if (remark.contains('runtime error') || remark.contains('out of memory')) {
+            throw const _ErrorHttp(504); // el servidor cortó la consulta: se trata como saturación
+          }
+          return j;
+        }
+        ultimo = 'respuesta inesperada';
+      } on _ErrorHttp catch (e) {
+        if (e.codigo == 400) throw const ErrorDescarga('Overpass rechazó la consulta (error 400).');
+        ultimo = 'HTTP ${e.codigo}';
+      } on TimeoutException {
+        ultimo = 'tiempo agotado';
+      } on SocketException {
+        ultimo = 'sin conexión a internet';
+      } on HandshakeException {
+        ultimo = 'error de conexión segura';
+      } on HttpException catch (e) {
+        ultimo = e.message;
+      } on FormatException {
+        ultimo = 'respuesta incompleta';
+      }
+      _turno++;
+      await Future<void>.delayed(Duration(seconds: 4 * (intento + 1)));
+    }
+    throw ErrorDescarga('Overpass no respondió ($ultimo). Revisa tu internet e inténtalo de nuevo.');
+  }
+}
+
+// ---------------------------------------------------------------- zonas
+class Catalogo {
+  final Overpass _op;
+  Catalogo(this._op);
+
+  /// Un estado (o los 32 si [uno] es null) con su rectángulo envolvente, desde OpenStreetMap.
+  Future<List<Zona>> estados({EstadoMx? uno, required bool Function() cancelado}) async {
+    final filtro = uno == null ? '["ISO3166-2"~"^MX-"]' : '["ISO3166-2"="${uno.iso}"]';
+    final j = await _op.consultar(
+        '[out:json][timeout:90];rel$filtro["boundary"="administrative"]["admin_level"="4"];out bb;', cancelado);
+    final r = <Zona>[];
+    final els = j['elements'];
+    if (els is List) {
+      for (final e in els) {
+        if (e is! Map || e['type'] != 'relation') continue;
+        final b = e['bounds'];
+        if (b is! Map) continue;
+        final tags = e['tags'];
+        final nombre = tags is Map ? '${tags['name'] ?? tags['ISO3166-2'] ?? e['id']}' : '${e['id']}';
+        r.add(Zona(nombre, (e['id'] as num).toInt(), (b['minlat'] as num).toDouble(), (b['minlon'] as num).toDouble(),
+            (b['maxlat'] as num).toDouble(), (b['maxlon'] as num).toDouble()));
+      }
+    }
+    if (r.isEmpty) {
+      throw ErrorDescarga(uno == null
+          ? 'No pude obtener la lista de estados desde OpenStreetMap.'
+          : 'No encontré ${uno.nombre} en OpenStreetMap.');
+    }
+    return r;
+  }
+
+  /// Busca municipios por nombre dentro de un estado (Nominatim, máx. 1 consulta por pulsación).
+  Future<List<Zona>> buscarMunicipios(String texto, EstadoMx estado) async {
+    final url = Uri.https('nominatim.openstreetmap.org', '/search', {
+      'q': '${texto.trim()}, ${estado.nombre}, México',
+      'format': 'jsonv2',
+      'countrycodes': 'mx',
+      'limit': '10',
+      'accept-language': 'es',
+    });
+    try {
+      final datos = await ClienteHttp.bytes(url, limite: const Duration(seconds: 30));
+      final lista = jsonDecode(utf8.decode(datos));
+      final r = <Zona>[];
+      if (lista is List) {
+        for (final e in lista) {
+          if (e is! Map || e['osm_type'] != 'relation') continue;
+          final bb = e['boundingbox'];
+          if (bb is! List || bb.length < 4) continue;
+          final s = double.tryParse('${bb[0]}'), n = double.tryParse('${bb[1]}');
+          final w = double.tryParse('${bb[2]}'), o = double.tryParse('${bb[3]}');
+          final id = e['osm_id'];
+          if (s == null || n == null || w == null || o == null || id is! num) continue;
+          final nombre = '${e['display_name'] ?? e['name'] ?? id}'.split(',').take(2).join(',').trim();
+          r.add(Zona(nombre, id.toInt(), s, w, n, o));
+        }
+      }
+      return r;
+    } on _ErrorHttp catch (e) {
+      throw ErrorDescarga(e.codigo == 429
+          ? 'El buscador pide esperar un momento. Intenta de nuevo en unos segundos.'
+          : 'El buscador de lugares respondió ${e.codigo}.');
+    } on TimeoutException {
+      throw const ErrorDescarga('El buscador de lugares tardó demasiado. Revisa tu internet.');
+    } on IOException {
+      throw const ErrorDescarga('Sin conexión a internet.');
+    } on FormatException {
+      throw const ErrorDescarga('Respuesta inválida del buscador de lugares.');
+    }
+  }
+}
+
+// ---------------------------------------------------------------- red vial
+class _Celda {
+  final Zona zona;
+  final double s, w, n, e;
+  const _Celda(this.zona, this.s, this.w, this.n, this.e);
+  double get lado => math.max(n - s, e - w);
+}
+
+/// Descarga las vías de OSM por bloques y las guarda como GeoJSON con UNA VÍA POR LÍNEA.
+/// Si un bloque trae demasiadas vías (ciudad densa) lo divide en 4 y vuelve a pedirlo,
+/// así ningún bloque llega a ser tan grande como para agotar la memoria del teléfono.
+class DescargadorRed {
+  static const int _maxViasPorBloque = 6000;
+  final Overpass _op;
+  DescargadorRed(this._op);
+
+  static List<_Celda> bloquesIniciales(List<Zona> zonas) {
+    const paso = 1.0;
+    final r = <_Celda>[];
+    for (final z in zonas) {
+      for (var s = z.sur; s < z.norte; s += paso) {
+        for (var w = z.oeste; w < z.este; w += paso) {
+          r.add(_Celda(z, s, w, math.min(s + paso, z.norte), math.min(w + paso, z.este)));
+        }
+      }
+      if (r.isEmpty || !identical(r.last.zona, z)) {
+        r.add(_Celda(z, z.sur, z.oeste, z.norte + 0.01, z.este + 0.01)); // zona diminuta
+      }
+    }
+    return r;
+  }
+
+  String _consulta(_Celda c, Detalle d) {
+    final caja = '${c.s.toStringAsFixed(5)},${c.w.toStringAsFixed(5)},${c.n.toStringAsFixed(5)},${c.e.toStringAsFixed(5)}';
+    return '[out:json][timeout:180];area(${c.zona.areaId})->.a;'
+        'way(area.a)["highway"~"^(${d.filtro})\$"]($caja);out geom qt $_maxViasPorBloque;';
+  }
+
+  /// Devuelve cuántas vías se guardaron.
+  Future<int> descargar({
+    required List<Zona> zonas,
+    required Detalle detalle,
+    required File salida,
+    required void Function(double, String) progreso,
+    required bool Function() cancelado,
+  }) async {
+    final cola = bloquesIniciales(zonas);
+    final vistos = <int>{};
+    var i = 0, vias = 0, primero = true;
+    final sink = salida.openWrite();
+    try {
+      sink.write('$_cabeceraGeoJson\n');
+      while (i < cola.length) {
+        if (cancelado()) throw const ErrorDescarga('Descarga cancelada.');
+        final c = cola[i++];
+        final j = await _op.consultar(_consulta(c, detalle), cancelado);
+        final els = j['elements'];
+        final List lista = els is List ? els : <dynamic>[];
+        if (lista.length >= _maxViasPorBloque && c.lado > 0.01) {
+          final mf = (c.s + c.n) / 2, mw = (c.w + c.e) / 2;
+          cola.add(_Celda(c.zona, c.s, c.w, mf, mw));
+          cola.add(_Celda(c.zona, c.s, mw, mf, c.e));
+          cola.add(_Celda(c.zona, mf, c.w, c.n, mw));
+          cola.add(_Celda(c.zona, mf, mw, c.n, c.e));
+        } else {
+          for (final e in lista) {
+            if (e is! Map || e['type'] != 'way') continue;
+            final id = e['id'];
+            if (id is! int || vistos.contains(id)) continue;
+            final tags = e['tags'];
+            final geom = e['geometry'];
+            if (tags is! Map || geom is! List) continue;
+            final hw = '${tags['highway']}';
+            if (claseDesdeOsm(hw) == null) continue;
+            final coords = StringBuffer();
+            var k = 0;
+            for (final p in geom) {
+              if (p is! Map) continue;
+              final lat = p['lat'], lon = p['lon'];
+              if (lat is! num || lon is! num) continue;
+              if (k++ > 0) coords.write(',');
+              coords.write('[${lon.toStringAsFixed(6)},${lat.toStringAsFixed(6)}]');
+            }
+            if (k < 2) continue;
+            vistos.add(id);
+            final linea = StringBuffer(primero ? '' : ',');
+            primero = false;
+            linea.write('{"type":"Feature","properties":{"highway":"$hw"');
+            final ow = tags['oneway'];
+            if (ow != null) linea.write(',"oneway":${jsonEncode('$ow')}');
+            final jn = tags['junction'];
+            if (jn != null) linea.write(',"junction":${jsonEncode('$jn')}');
+            linea.write('},"geometry":{"type":"LineString","coordinates":[$coords]}}');
+            sink.writeln(linea.toString());
+            vias++;
+          }
+          await sink.flush();
+        }
+        progreso(i / cola.length, 'Red vial: ${c.zona.nombre} · bloque $i de ${cola.length} · $vias vías');
+        await Future<void>.delayed(const Duration(milliseconds: 500)); // cortesía con el servidor público
+      }
+      sink.write(']}\n');
+    } finally {
+      await sink.close();
+    }
+    if (vias == 0) {
+      throw const ErrorDescarga('OpenStreetMap no tiene vías con ese nivel de detalle en la zona elegida.');
+    }
+    return vias;
+  }
+}
+
+// ---------------------------------------------------------------- mapas (MBTiles)
+class Teselas {
+  static int x(double lon, int z) {
+    final n = 1 << z;
+    return math.max(0, math.min(n - 1, ((lon + 180.0) / 360.0 * n).floor()));
+  }
+
+  static int y(double lat, int z) {
+    final n = 1 << z;
+    final la = math.max(-85.0511, math.min(85.0511, lat)) * math.pi / 180.0;
+    final v = ((1 - math.log(math.tan(la) + 1 / math.cos(la)) / math.pi) / 2 * n).floor();
+    return math.max(0, math.min(n - 1, v));
+  }
+
+  /// Cuántas teselas cubren la zona entre [zMin] y [zMax].
+  static int contar(Zona zona, int zMin, int zMax) {
+    var t = 0;
+    for (var z = zMin; z <= zMax; z++) {
+      t += (x(zona.este, z) - x(zona.oeste, z) + 1) * (y(zona.sur, z) - y(zona.norte, z) + 1);
+    }
+    return t;
+  }
+}
+
+String? _formatoImagen(Uint8List b) {
+  if (b.length < 12) return null;
+  if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return 'png';
+  if (b[0] == 0xFF && b[1] == 0xD8) return 'jpg';
+  if (b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 && b[8] == 0x57 && b[9] == 0x45) return 'webp';
+  return null;
+}
+
+/// Recorre todas las teselas (z, x, y) de la zona sin guardar la lista completa en memoria.
+class _CursorTeselas {
+  final Zona zona;
+  final int zMax;
+  int z;
+  int _x = 0, _x1 = 0, _y = 0, _yIni = 0, _y1 = 0;
+
+  _CursorTeselas(this.zona, int zMin, this.zMax) : z = zMin {
+    _preparar();
+  }
+
+  void _preparar() {
+    _x = Teselas.x(zona.oeste, z);
+    _x1 = Teselas.x(zona.este, z);
+    _yIni = Teselas.y(zona.norte, z);
+    _y1 = Teselas.y(zona.sur, z);
+    _y = _yIni;
+  }
+
+  ({int z, int x, int y})? siguiente() {
+    if (z > zMax) return null;
+    final r = (z: z, x: _x, y: _y);
+    _y++;
+    if (_y > _y1) {
+      _x++;
+      _y = _yIni;
+      if (_x > _x1) {
+        z++;
+        if (z <= zMax) _preparar();
+      }
+    }
+    return r;
+  }
+}
+
+/// Descarga teselas raster de un servidor XYZ y las empaqueta en un archivo .mbtiles
+/// (esquema TMS, igual que lee ProveedorMbTiles).
+class DescargadorMapa {
+  static const int _tamLote = 150;
+
+  Future<int> descargar({
+    required Zona zona,
+    required String plantilla, // https://servidor/{z}/{x}/{y}.png
+    required int zMin,
+    required int zMax,
+    required File salida,
+    required void Function(double, String) progreso,
+    required bool Function() cancelado,
+    int simultaneas = 4,
+  }) async {
+    if (await salida.exists()) await salida.delete();
+    final db = await openDatabase(salida.path, version: 1, onCreate: (d, v) async {
+      await d.execute('CREATE TABLE metadata (name TEXT, value TEXT)');
+      await d.execute('CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)');
+      await d.execute('CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row)');
+    });
+    try {
+      final cursor = _CursorTeselas(zona, zMin, zMax);
+      final total = Teselas.contar(zona, zMin, zMax);
+      var hechas = 0, guardadas = 0, fallosSeguidos = 0;
+      String? formato;
+      ErrorDescarga? fatal;
+      final lote = <Map<String, Object?>>[];
+      Future<void> escritura = Future<void>.value();
+
+      Future<void> volcar() {
+        if (lote.isEmpty) return escritura;
+        final copia = List<Map<String, Object?>>.of(lote);
+        lote.clear();
+        escritura = escritura.then((_) async {
+          final b = db.batch();
+          for (final fila in copia) {
+            b.insert('tiles', fila, conflictAlgorithm: ConflictAlgorithm.replace);
+          }
+          await b.commit(noResult: true);
+        });
+        return escritura;
+      }
+
+      Future<void> trabajador() async {
+        while (fatal == null && !cancelado()) {
+          final t = cursor.siguiente();
+          if (t == null) return;
+          final url = plantilla
+              .replaceAll('{z}', '${t.z}')
+              .replaceAll('{x}', '${t.x}')
+              .replaceAll('{y}', '${t.y}');
+          Uint8List? datos;
+          var inexistente = false;
+          for (var intento = 0; intento < 3 && datos == null && !inexistente && fatal == null; intento++) {
+            try {
+              datos = await ClienteHttp.bytes(Uri.parse(url), limite: const Duration(seconds: 30));
+            } on _ErrorHttp catch (e) {
+              if (e.codigo == 404 || e.codigo == 204) {
+                inexistente = true;
+              } else if (e.codigo == 401 || e.codigo == 403 || e.codigo == 429) {
+                fatal = ErrorDescarga('El servidor de teselas respondió ${e.codigo} (acceso denegado o límite alcanzado). '
+                    'Revisa la URL y los términos del servicio, o baja el zoom máximo.');
+              } else {
+                await Future<void>.delayed(Duration(milliseconds: 500 * (intento + 1)));
+              }
+            } on TimeoutException {
+              await Future<void>.delayed(Duration(milliseconds: 500 * (intento + 1)));
+            } on IOException {
+              await Future<void>.delayed(Duration(milliseconds: 500 * (intento + 1)));
+            }
+          }
+          if (datos != null && datos.isNotEmpty) {
+            final f = _formatoImagen(datos);
+            if (f == null) {
+              fatal = const ErrorDescarga('El servidor no devolvió imágenes PNG/JPG/WEBP. '
+                  'Revisa la URL: debe ser de teselas raster, no vectoriales.');
+            } else {
+              formato ??= f;
+              lote.add({
+                'zoom_level': t.z,
+                'tile_column': t.x,
+                'tile_row': (1 << t.z) - 1 - t.y, // XYZ → TMS
+                'tile_data': datos,
+              });
+              guardadas++;
+              fallosSeguidos = 0;
+              if (lote.length >= _tamLote) await volcar();
+            }
+          } else if (!inexistente && fatal == null) {
+            fallosSeguidos++;
+            if (fallosSeguidos >= 40) {
+              fatal = const ErrorDescarga('Demasiados errores seguidos: revisa tu internet o la URL del servidor.');
+            }
+          }
+          hechas++;
+          if (hechas % 20 == 0) progreso(hechas / total, 'Mapa: $hechas de $total teselas');
+        }
+      }
+
+      await Future.wait(List<Future<void>>.generate(simultaneas, (_) => trabajador()));
+      await volcar();
+      await escritura;
+      if (cancelado()) throw const ErrorDescarga('Descarga cancelada.');
+      final fallo = fatal;
+      if (fallo != null) throw fallo;
+      if (guardadas == 0) {
+        throw const ErrorDescarga('El servidor no tiene teselas para esa zona y esos niveles de zoom.');
+      }
+      final meta = <String, String>{
+        'name': zona.nombre,
+        'format': formato ?? 'png',
+        'bounds': '${zona.oeste},${zona.sur},${zona.este},${zona.norte}',
+        'minzoom': '$zMin',
+        'maxzoom': '$zMax',
+        'type': 'baselayer',
+        'version': '1',
+        'description': 'Descargado por la app para ${zona.nombre}',
+      };
+      final loteMeta = db.batch();
+      meta.forEach((k, v) => loteMeta.insert('metadata', {'name': k, 'value': v}));
+      await loteMeta.commit(noResult: true);
+      await db.close();
+      return guardadas;
+    } catch (_) {
+      try {
+        await db.close();
+      } catch (_) {}
+      try {
+        if (await salida.exists()) await salida.delete();
+      } catch (_) {}
+      rethrow;
+    }
+  }
+}
+
+// ============================================================================
 // 8. CONTROLADOR (equivalente al ViewModel): estado + lógica de navegación
 // ============================================================================
 
@@ -1219,6 +1879,7 @@ class Controlador extends ChangeNotifier {
   Future<void> iniciar() async {
     voz.alError = _msg;
     await datos.abrir();
+    await _leerAjustesDescarga();
     await _recargar();
     await voz.iniciar();
     unawaited(stt.cargarModelo().then((_) => notifyListeners())); // modelo de voz en segundo plano
@@ -1944,32 +2605,281 @@ class Controlador extends ChangeNotifier {
     }
   }
 
+  // ---- Regiones de red vial guardadas (varios .geojson en la carpeta «red») ----
+  Future<List<File>> _archivosRed() async {
+    final dir = await _carpeta('red');
+    final r = dir.listSync().whereType<File>().where((f) => f.path.toLowerCase().endsWith('.geojson')).toList();
+    r.sort((a, b) => a.path.compareTo(b.path));
+    return r;
+  }
+
+  /// Carga TODAS las regiones guardadas en un solo grafo (se unen por coordenadas).
   Future<void> _cargarRedGuardada() async {
-    final f = File(ruta_p.join((await _carpeta('red')).path, 'red_vial.geojson'));
-    if (!await f.exists()) return;
+    final archivos = await _archivosRed();
+    regionesRed = archivos;
+    if (archivos.isEmpty) {
+      motor.red = null;
+      redCargada = false;
+      redEstado = 'Sin red vial: se usa ruta en línea recta';
+      notifyListeners();
+      return;
+    }
     redEstado = 'Cargando red vial…';
     notifyListeners();
     try {
-      final n = await motor.cargar(f.path);
+      final n = await motor.cargar(archivos.map((f) => f.path).toList());
       redCargada = true;
-      redEstado = 'Red vial cargada ($n nodos)';
+      redEstado = 'Red vial cargada ($n nodos, ${archivos.length} ${archivos.length == 1 ? 'región' : 'regiones'})';
       notifyListeners();
       if (destino != null && fase != Fase.navegando) _calcularRuta();
     } catch (e) {
       redCargada = false;
-      redEstado = 'Red vial inválida: $e';
+      redEstado = 'Red vial inválida o demasiado grande para este equipo: $e';
       notifyListeners();
     }
   }
 
+  Future<void> eliminarRegionRed(File f) async {
+    try {
+      if (await f.exists()) await f.delete();
+    } catch (e) {
+      _msg('No se pudo borrar la región: $e');
+    }
+    await _cargarRedGuardada();
+  }
+
   Future<void> quitarRedVial() async {
-    motor.red = null;
-    final f = File(ruta_p.join((await _carpeta('red')).path, 'red_vial.geojson'));
-    if (await f.exists()) await f.delete();
-    redCargada = false;
-    redEstado = 'Sin red vial: se usa ruta en línea recta';
+    for (final f in await _archivosRed()) {
+      try {
+        await f.delete();
+      } catch (_) {}
+    }
+    await _cargarRedGuardada();
+  }
+
+  // ---------------------------------------------------- descarga de mapas y red vial
+  bool descargando = false;
+  bool descargaEsMapa = false;
+  double progresoDescarga = 0;
+  String textoDescarga = '';
+  String plantillaTeselas = '';
+  List<File> regionesRed = [];
+  bool _cancelarDescarga = false;
+  final Overpass _overpass = Overpass();
+  late final Catalogo catalogo = Catalogo(_overpass);
+
+  Future<File> _archivoAjustesDescarga() async =>
+      File(ruta_p.join((await getApplicationDocumentsDirectory()).path, 'ajustes_descarga.json'));
+
+  Future<void> _leerAjustesDescarga() async {
+    try {
+      final f = await _archivoAjustesDescarga();
+      if (await f.exists()) {
+        final m = jsonDecode(await f.readAsString());
+        if (m is Map) plantillaTeselas = '${m['plantilla'] ?? ''}';
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _guardarPlantilla(String p) async {
+    plantillaTeselas = p;
+    try {
+      await (await _archivoAjustesDescarga()).writeAsString(jsonEncode({'plantilla': p}));
+    } catch (_) {}
+  }
+
+  void _iniciarDescarga(bool esMapa, String texto) {
+    descargando = true;
+    descargaEsMapa = esMapa;
+    _cancelarDescarga = false;
+    progresoDescarga = 0;
+    textoDescarga = texto;
+    WakelockPlus.enable(); // la pantalla no se apaga mientras se descarga
     notifyListeners();
-    if (destino != null && fase != Fase.navegando) _calcularRuta();
+  }
+
+  void _terminarDescarga() {
+    descargando = false;
+    progresoDescarga = 0;
+    textoDescarga = '';
+    if (fase != Fase.navegando) WakelockPlus.disable();
+    notifyListeners();
+  }
+
+  void _progresoDescarga(double p, String texto) {
+    progresoDescarga = p.clamp(0.0, 1.0).toDouble();
+    textoDescarga = texto;
+    notifyListeners();
+  }
+
+  void cancelarDescarga() {
+    if (!descargando) return;
+    _cancelarDescarga = true;
+    textoDescarga = 'Cancelando…';
+    notifyListeners();
+  }
+
+  Future<List<Zona>> buscarMunicipios(String texto, EstadoMx estado) async {
+    try {
+      final r = await catalogo.buscarMunicipios(texto, estado);
+      if (r.isEmpty) _msg('No encontré ese municipio en ${estado.nombre}.');
+      return r;
+    } on ErrorDescarga catch (e) {
+      _msg(e.mensaje);
+      return <Zona>[];
+    }
+  }
+
+  static String _slug(String t) => Fmt.normalizar(t).replaceAll(RegExp(r'[^a-z0-9]+'), '_').replaceAll(RegExp(r'^_+|_+$'), '');
+
+  /// Descarga la red vial de OpenStreetMap (Overpass) del país, un estado o un municipio.
+  Future<void> descargarRedVial({
+    required Alcance alcance,
+    EstadoMx? estado,
+    Zona? municipio,
+    required Detalle detalle,
+    required Future<bool> Function(String) confirmar,
+  }) async {
+    if (descargando) return;
+    if (alcance != Alcance.pais && estado == null) return _msg('Elige un estado.');
+    if (alcance == Alcance.municipio && municipio == null) return _msg('Busca y elige un municipio.');
+    final det = alcance == Alcance.pais ? Detalle.troncal : detalle;
+    final dir = await _carpeta('red');
+    late final String nombreArchivo;
+    if (alcance == Alcance.pais) {
+      nombreArchivo = 'red_mexico.geojson';
+    } else if (alcance == Alcance.estado) {
+      nombreArchivo = 'red_${estado!.iso.substring(3).toLowerCase()}.geojson';
+    } else {
+      nombreArchivo = 'red_mun_${municipio!.relId}_${_slug(municipio.nombre)}.geojson';
+    }
+    final destinoArchivo = File(ruta_p.join(dir.path, nombreArchivo));
+    final parcial = File('${destinoArchivo.path}.part');
+
+    final lugar = alcance == Alcance.pais ? 'todo México' : (alcance == Alcance.estado ? estado!.nombre : municipio!.nombre);
+    final aviso = StringBuffer('Red vial de $lugar\nDetalle: ${det.etiqueta}\n\n')
+      ..write('Fuente: OpenStreetMap (Overpass API). Puede tardar varios minutos')
+      ..write(alcance == Alcance.pais ? ' (30 o más para todo el país)' : '')
+      ..write(' y pesar de decenas a cientos de MB. Mantén la app abierta; la pantalla no se apagará.');
+    if (alcance == Alcance.estado && det == Detalle.completo) {
+      aviso.write('\n\nOJO: el detalle «Completo» de un estado entero es muy pesado y en un equipo de 4 GB puede no cargar. '
+          'Recomendado: Estándar.');
+    }
+    if (!await confirmar(aviso.toString())) return;
+
+    _iniciarDescarga(false, 'Buscando la zona en OpenStreetMap…');
+    try {
+      final List<Zona> zonas;
+      if (alcance == Alcance.pais) {
+        zonas = await catalogo.estados(cancelado: () => _cancelarDescarga);
+      } else if (alcance == Alcance.estado) {
+        zonas = await catalogo.estados(uno: estado, cancelado: () => _cancelarDescarga);
+      } else {
+        zonas = <Zona>[municipio!];
+      }
+      final vias = await DescargadorRed(_overpass).descargar(
+        zonas: zonas,
+        detalle: det,
+        salida: parcial,
+        progreso: _progresoDescarga,
+        cancelado: () => _cancelarDescarga,
+      );
+      await parcial.rename(destinoArchivo.path);
+      _progresoDescarga(1, 'Cargando la red vial en memoria…');
+      await _cargarRedGuardada();
+      _msg('Red vial de $lugar lista ($vias vías).');
+    } on ErrorDescarga catch (e) {
+      await _borrarSilencioso(parcial);
+      _msg(e.mensaje);
+    } catch (e) {
+      await _borrarSilencioso(parcial);
+      _msg('Falló la descarga de la red vial: $e');
+    } finally {
+      _terminarDescarga();
+    }
+  }
+
+  Future<void> _borrarSilencioso(File f) async {
+    try {
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+  }
+
+  /// Descarga teselas raster del país, un estado o un municipio y las guarda como .mbtiles.
+  Future<void> descargarMapa({
+    required Alcance alcance,
+    EstadoMx? estado,
+    Zona? municipio,
+    required int zMin,
+    required int zMax,
+    required String plantilla,
+    required Future<bool> Function(String) confirmar,
+  }) async {
+    if (descargando) return;
+    if (alcance != Alcance.pais && estado == null) return _msg('Elige un estado.');
+    if (alcance == Alcance.municipio && municipio == null) return _msg('Busca y elige un municipio.');
+    final url = plantilla.trim();
+    if (!url.contains('{z}') || !url.contains('{x}') || !url.contains('{y}')) {
+      return _msg('La URL del servidor debe incluir {z}, {x} y {y}. Ej.: https://servidor/{z}/{x}/{y}.png');
+    }
+    final uri = Uri.tryParse(url.replaceAll('{z}', '0').replaceAll('{x}', '0').replaceAll('{y}', '0'));
+    if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) {
+      return _msg('Usa una URL segura que empiece con https://');
+    }
+    if (zMax < zMin) return _msg('El zoom máximo debe ser mayor o igual al mínimo ($zMin).');
+    await _guardarPlantilla(url);
+
+    _iniciarDescarga(true, 'Buscando la zona…');
+    try {
+      final Zona zona;
+      if (alcance == Alcance.pais) {
+        zona = zonaMexico;
+      } else if (alcance == Alcance.estado) {
+        zona = (await catalogo.estados(uno: estado, cancelado: () => _cancelarDescarga)).first;
+      } else {
+        zona = municipio!;
+      }
+      final total = Teselas.contar(zona, zMin, zMax);
+      if (total > 400000) {
+        _msg('Son $total teselas: demasiadas para un teléfono. Baja el zoom máximo.');
+        return;
+      }
+      final mb = (total * 0.02).round(); // ~20 KB por tesela, solo como referencia
+      _progresoDescarga(0, 'Esperando confirmación…');
+      final ok = await confirmar('Mapa de ${zona.nombre}\nZoom $zMin a $zMax\n\n'
+          '$total teselas (~$mb MB, es un cálculo aproximado)\nServidor: ${uri.host}\n\n'
+          'Asegúrate de que ese servidor permita descargar teselas para uso sin conexión. '
+          'Mantén la app abierta; la pantalla no se apagará.');
+      if (!ok) return;
+
+      final dir = await _carpeta('mapas');
+      final nombre = 'mapa_${_slug(zona.nombre)}_z$zMin-$zMax.mbtiles';
+      final parcial = File(ruta_p.join(dir.path, '$nombre.part'));
+      final destinoArchivo = File(ruta_p.join(dir.path, nombre));
+      try {
+        final n = await DescargadorMapa().descargar(
+          zona: zona,
+          plantilla: url,
+          zMin: zMin,
+          zMax: zMax,
+          salida: parcial,
+          progreso: _progresoDescarga,
+          cancelado: () => _cancelarDescarga,
+        );
+        if (await destinoArchivo.exists()) await destinoArchivo.delete();
+        await parcial.rename(destinoArchivo.path);
+        _msg('Mapa de ${zona.nombre} listo ($n teselas).');
+      } finally {
+        await _borrarSilencioso(parcial);
+        await _abrirMapas();
+      }
+    } on ErrorDescarga catch (e) {
+      _msg(e.mensaje);
+    } catch (e) {
+      _msg('Falló la descarga del mapa: $e');
+    } finally {
+      _terminarDescarga();
+    }
   }
 
   @override
@@ -2561,6 +3471,14 @@ class PantallaMenu extends StatelessWidget {
     ]);
   }
 
+  static String _tamanoArchivo(File f) {
+    try {
+      return '${(f.lengthSync() / 1048576).toStringAsFixed(1)} MB';
+    } catch (_) {
+      return '';
+    }
+  }
+
   Widget _ajustes(BuildContext ctx) {
     return ListView(padding: const EdgeInsets.all(16), children: [
       SwitchListTile(
@@ -2595,14 +3513,270 @@ class PantallaMenu extends StatelessWidget {
       const Divider(),
       const Text('Red vial para enrutamiento', style: TextStyle(fontWeight: FontWeight.bold)),
       Text(c.redEstado),
+      for (final f in c.regionesRed)
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          leading: const Icon(Icons.alt_route),
+          title: Text(ruta_p.basename(f.path), maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text(_tamanoArchivo(f)),
+          trailing: IconButton(onPressed: () => c.eliminarRegionRed(f), icon: const Icon(Icons.delete_outline)),
+        ),
       const SizedBox(height: 8),
       FilledButton(onPressed: c.importarRedVial, child: const Text('Importar red vial (GeoJSON)')),
       if (c.redCargada)
         Padding(
           padding: const EdgeInsets.only(top: 8),
-          child: OutlinedButton(onPressed: c.quitarRedVial, child: const Text('Quitar red vial')),
+          child: OutlinedButton(onPressed: c.quitarRedVial, child: const Text('Quitar toda la red vial')),
         ),
+      const Divider(),
+      // ---- Descargas desde repositorios públicos (se despliegan al tocarlas) ----
+      ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        leading: const Icon(Icons.map_outlined),
+        title: const Text('Descargar mapas MBTiles'),
+        subtitle: const Text('País, estado o municipio'),
+        children: [PanelDescarga(c, esMapa: true)],
+      ),
+      ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        leading: const Icon(Icons.alt_route),
+        title: const Text('Descargar red vial para enrutamiento'),
+        subtitle: const Text('País, estado o municipio'),
+        children: [PanelDescarga(c, esMapa: false)],
+      ),
+      const SizedBox(height: 24),
     ]);
+  }
+}
+
+// ============================================================================
+// 10B. PANEL DE DESCARGA (mapas MBTiles / red vial) — se despliega desde Ajustes
+// ============================================================================
+
+class PanelDescarga extends StatefulWidget {
+  final Controlador c;
+  final bool esMapa; // true = mapas MBTiles, false = red vial
+  const PanelDescarga(this.c, {required this.esMapa, super.key});
+
+  @override
+  State<PanelDescarga> createState() => _EstadoPanelDescarga();
+}
+
+class _EstadoPanelDescarga extends State<PanelDescarga> {
+  Alcance _alcance = Alcance.estado;
+  EstadoMx _estado = estadosMx.firstWhere((e) => e.iso == 'MX-JAL');
+  final TextEditingController _txtMunicipio = TextEditingController();
+  late final TextEditingController _txtUrl;
+  List<Zona> _resultados = <Zona>[];
+  Zona? _municipio;
+  bool _buscando = false;
+  Detalle _detalle = Detalle.estandar;
+  int _zMax = 12;
+
+  static int _zMinPara(Alcance a) => a == Alcance.pais ? 4 : (a == Alcance.estado ? 6 : 10);
+  static int _zMaxPara(Alcance a) => a == Alcance.pais ? 8 : (a == Alcance.estado ? 12 : 15);
+
+  @override
+  void initState() {
+    super.initState();
+    _txtUrl = TextEditingController(text: widget.c.plantillaTeselas);
+  }
+
+  @override
+  void dispose() {
+    _txtMunicipio.dispose();
+    _txtUrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _buscarMunicipio() async {
+    final t = _txtMunicipio.text.trim();
+    if (t.isEmpty) return;
+    setState(() {
+      _buscando = true;
+      _resultados = <Zona>[];
+      _municipio = null;
+    });
+    final r = await widget.c.buscarMunicipios(t, _estado);
+    if (!mounted) return;
+    setState(() {
+      _buscando = false;
+      _resultados = r;
+      if (r.length == 1) _municipio = r.first;
+    });
+  }
+
+  Future<bool> _confirmar(String texto) async {
+    if (!mounted) return false;
+    final r = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Confirmar descarga'),
+        content: SingleChildScrollView(child: Text(texto)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Descargar')),
+        ],
+      ),
+    );
+    return r ?? false;
+  }
+
+  Future<void> _descargar() async {
+    final c = widget.c;
+    if (widget.esMapa) {
+      await c.descargarMapa(
+        alcance: _alcance,
+        estado: _estado,
+        municipio: _municipio,
+        zMin: _zMinPara(_alcance),
+        zMax: _zMax,
+        plantilla: _txtUrl.text,
+        confirmar: _confirmar,
+      );
+    } else {
+      await c.descargarRedVial(
+        alcance: _alcance,
+        estado: _estado,
+        municipio: _municipio,
+        detalle: _detalle,
+        confirmar: _confirmar,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.c;
+    return ListenableBuilder(
+      listenable: c,
+      builder: (ctx, _) {
+        final ocupado = c.descargando;
+        final miDescarga = ocupado && c.descargaEsMapa == widget.esMapa;
+        return Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('¿Qué zona necesitas?'),
+          const SizedBox(height: 8),
+          SegmentedButton<Alcance>(
+            segments: const <ButtonSegment<Alcance>>[
+              ButtonSegment<Alcance>(value: Alcance.pais, label: Text('País')),
+              ButtonSegment<Alcance>(value: Alcance.estado, label: Text('Estado')),
+              ButtonSegment<Alcance>(value: Alcance.municipio, label: Text('Municipio')),
+            ],
+            selected: <Alcance>{_alcance},
+            onSelectionChanged: ocupado
+                ? null
+                : (s) => setState(() {
+                      _alcance = s.first;
+                      _zMax = _zMaxPara(_alcance);
+                    }),
+          ),
+          if (_alcance != Alcance.pais) ...[
+            const SizedBox(height: 12),
+            DropdownButton<EstadoMx>(
+              isExpanded: true,
+              value: _estado,
+              items: [
+                for (final e in estadosMx) DropdownMenuItem<EstadoMx>(value: e, child: Text(e.nombre)),
+              ],
+              onChanged: ocupado
+                  ? null
+                  : (e) => setState(() {
+                        if (e != null) {
+                          _estado = e;
+                          _municipio = null;
+                          _resultados = <Zona>[];
+                        }
+                      }),
+            ),
+          ],
+          if (_alcance == Alcance.municipio) ...[
+            TextField(
+              controller: _txtMunicipio,
+              enabled: !ocupado,
+              textInputAction: TextInputAction.search,
+              decoration: InputDecoration(
+                labelText: 'Municipio de ${_estado.nombre} (ej. Zapopan)',
+                suffixIcon: IconButton(icon: const Icon(Icons.search), onPressed: ocupado ? null : _buscarMunicipio),
+              ),
+              onSubmitted: (_) => _buscarMunicipio(),
+            ),
+            if (_buscando) const LinearProgressIndicator(),
+            for (final z in _resultados)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                selected: identical(z, _municipio),
+                leading: Icon(identical(z, _municipio) ? Icons.radio_button_checked : Icons.radio_button_unchecked),
+                title: Text(z.nombre, maxLines: 2, overflow: TextOverflow.ellipsis),
+                onTap: ocupado ? null : () => setState(() => _municipio = z),
+              ),
+          ],
+          const SizedBox(height: 12),
+          if (widget.esMapa) ...[
+            TextField(
+              controller: _txtUrl,
+              enabled: !ocupado,
+              keyboardType: TextInputType.url,
+              decoration: const InputDecoration(
+                labelText: 'Servidor de teselas raster (XYZ)',
+                hintText: 'https://tu-servidor/{z}/{x}/{y}.png',
+                helperMaxLines: 6,
+                helperText: 'La app no trae un servidor fijo: usa uno propio o de un proveedor cuya licencia permita '
+                    'descargar para uso sin conexión. El servidor público de OpenStreetMap '
+                    '(tile.openstreetmap.org) lo prohíbe.',
+              ),
+            ),
+            Row(children: [
+              Text('Zoom: ${_zMinPara(_alcance)} a '),
+              DropdownButton<int>(
+                value: _zMax,
+                items: [for (var z = 8; z <= 17; z++) DropdownMenuItem<int>(value: z, child: Text('$z'))],
+                onChanged: ocupado ? null : (v) => setState(() => _zMax = v ?? _zMax),
+              ),
+              const SizedBox(width: 8),
+              const Expanded(child: Text('Más zoom = más detalle y mucho más peso.', style: TextStyle(fontSize: 12))),
+            ]),
+          ] else ...[
+            if (_alcance == Alcance.pais)
+              const Text('Para todo el país se descargan solo las carreteras principales '
+                  '(autopistas, troncales y primarias).')
+            else
+              DropdownButton<Detalle>(
+                isExpanded: true,
+                value: _detalle,
+                items: [
+                  for (final d in Detalle.values)
+                    if (d != Detalle.troncal)
+                      DropdownMenuItem<Detalle>(value: d, child: Text(d.etiqueta, overflow: TextOverflow.ellipsis)),
+                ],
+                onChanged: ocupado ? null : (v) => setState(() => _detalle = v ?? _detalle),
+              ),
+            const SizedBox(height: 4),
+            const Text(
+              'Se guarda en la app y se une con las regiones que ya tengas (las rutas pueden cruzar de una a otra).',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: ocupado ? null : _descargar,
+            icon: const Icon(Icons.download),
+            label: Text(widget.esMapa ? 'Descargar mapa' : 'Descargar red vial'),
+          ),
+          if (miDescarga) ...[
+            const SizedBox(height: 12),
+            LinearProgressIndicator(value: c.progresoDescarga > 0 ? c.progresoDescarga : null),
+            const SizedBox(height: 4),
+            Text(c.textoDescarga, style: const TextStyle(fontSize: 12)),
+            TextButton(onPressed: c.cancelarDescarga, child: const Text('Cancelar descarga')),
+          ],
+        ]),
+      );
+      },
+    );
   }
 }
 
