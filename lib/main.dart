@@ -295,6 +295,7 @@ enum TipoGiro {
   izq('⬅'),
   cerradoIzq('↙'),
   vueltaU('↩'),
+  parada('📍'),
   llegada('🏁');
 
   const TipoGiro(this.flecha);
@@ -318,17 +319,39 @@ class Ruta {
   final List<Maniobra> maniobras;
   final bool aproximada; // true = línea recta (sin red vial o sin camino)
   final Modo modo;
-  const Ruta(this.puntos, this.acum, this.total, this.duracionS, this.maniobras, this.aproximada, this.modo);
+  final List<int> limiteSeg; // límite de velocidad (km/h) de cada segmento; 0 = desconocido
+  final List<String> calleSeg; // nombre de la calle de cada segmento; '' = sin nombre
+  const Ruta(this.puntos, this.acum, this.total, this.duracionS, this.maniobras, this.aproximada, this.modo,
+      {this.limiteSeg = const <int>[], this.calleSeg = const <String>[]});
 }
 
 /// Convierte la polilínea en instrucciones de giro en español.
-List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum) {
+/// [calles]: nombre de la calle de cada segmento (pts[i] → pts[i+1]).
+/// [paradas]: índice de vértice → texto de la parada intermedia que termina ahí.
+List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum,
+    {List<String> calles = const <String>[], Map<int, String> paradas = const <int, String>{}}) {
   const distRef = 12.0, angMin = 30.0, sepMin = 25.0;
   final res = <Maniobra>[];
   if (pts.length < 2) return res;
-  res.add(Maniobra(0, pts[0], TipoGiro.salida, 'Dirígete al ${Geo.cardinal(Geo.rumbo(pts[0], pts[1]))}', 0));
+  String calleEn(int seg) => seg >= 0 && seg < calles.length ? calles[seg] : '';
+
+  var primera = '';
+  for (var s = 0; s < pts.length - 1 && s < calles.length && acum[s] < 300; s++) {
+    if (calles[s].isNotEmpty) {
+      primera = calles[s];
+      break;
+    }
+  }
+  res.add(Maniobra(0, pts[0], TipoGiro.salida,
+      'Dirígete al ${Geo.cardinal(Geo.rumbo(pts[0], pts[1]))}${primera.isEmpty ? '' : ' por $primera'}', 0));
   var ultima = -sepMin;
   for (var i = 1; i < pts.length - 1; i++) {
+    final parada = paradas[i];
+    if (parada != null) {
+      res.add(Maniobra(i, pts[i], TipoGiro.parada, 'Llegas a $parada', acum[i]));
+      ultima = acum[i];
+      continue;
+    }
     var j = i - 1;
     while (j > 0 && acum[i] - acum[j] < distRef) {
       j--;
@@ -356,6 +379,8 @@ List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum) {
       tipo = der ? TipoGiro.ligeroDer : TipoGiro.ligeroIzq;
       texto = der ? 'Gira ligeramente a la derecha' : 'Gira ligeramente a la izquierda';
     }
+    final saliente = calleEn(i);
+    if (saliente.isNotEmpty && saliente != calleEn(i - 1)) texto = '$texto en $saliente';
     res.add(Maniobra(i, pts[i], tipo, texto, acum[i]));
     ultima = acum[i];
   }
@@ -369,50 +394,166 @@ List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum) {
 // ============================================================================
 
 /// Grafo en formato CSR con arreglos tipados (poca memoria en equipos de 4 GB).
+/// Por arista: [clase] tipo de vía, [contra] bits (1 = contra sentido, 2 = peaje),
+/// [velMax] límite de velocidad en km/h (0 = desconocido) y [nombreE] id del nombre de la calle (-1 = sin nombre).
 class RedVial {
   final Float64List lats, lons;
   final Int32List offs, dest;
   final Float32List dist;
-  final Uint8List clase, contra;
-  const RedVial(this.lats, this.lons, this.offs, this.dest, this.dist, this.clase, this.contra);
+  final Uint8List clase, contra, velMax;
+  final Int32List nombreE;
+  // Calles para buscar sin internet: nombre, nombre normalizado y nodos representativos
+  final List<String> nombres, nombresNorm;
+  final Int32List repOffs, repNodos;
+  // Índice de cuadrícula para encontrar el nodo más cercano sin recorrer toda la red
+  final double celdaG, minLat, minLon;
+  final int filas, cols;
+  final Int32List celdaOffs, celdaNodos;
+
+  RedVial({
+    required this.lats,
+    required this.lons,
+    required this.offs,
+    required this.dest,
+    required this.dist,
+    required this.clase,
+    required this.contra,
+    required this.velMax,
+    required this.nombreE,
+    required this.nombres,
+    required this.nombresNorm,
+    required this.repOffs,
+    required this.repNodos,
+    required this.celdaG,
+    required this.minLat,
+    required this.minLon,
+    required this.filas,
+    required this.cols,
+    required this.celdaOffs,
+    required this.celdaNodos,
+  });
 
   int get nodos => lats.length;
 
   bool _tieneSalida(int i, Modo m) {
     for (var e = offs[i]; e < offs[i + 1]; e++) {
-      if (m.velEnVia(ClaseVia.values[clase[e]]) > 0 && (contra[e] == 0 || m.ignoraSentido)) return true;
+      if (m.velEnVia(ClaseVia.values[clase[e]]) > 0 && ((contra[e] & 1) == 0 || m.ignoraSentido)) return true;
     }
     return false;
   }
 
-  /// Nodo transitable más cercano a [c], o -1 si está a más de [maxM].
+  /// Nodo transitable más cercano a [c], o -1 si está a más de [maxM]. Usa la cuadrícula (rápido en redes grandes).
   int nodoCercano(LatLng c, Modo m, double maxM) {
-    final kx = 111320.0 * math.cos(c.latitude * math.pi / 180.0);
+    if (lats.isEmpty) return -1;
+    final kx = math.max(1000.0, 111320.0 * math.cos(c.latitude * math.pi / 180.0));
     const ky = 110540.0;
+    final celdaM = math.min(celdaG * kx, celdaG * ky);
+    final cr = ((c.latitude - minLat) / celdaG).floor();
+    final cc = ((c.longitude - minLon) / celdaG).floor();
+    final maxAnillos = (maxM / celdaM).ceil() + 1;
     var mejor = -1;
     var mejorD2 = double.maxFinite;
-    for (var i = 0; i < lats.length; i++) {
-      final dx = (lons[i] - c.longitude) * kx, dy = (lats[i] - c.latitude) * ky;
-      final d2 = dx * dx + dy * dy;
-      if (d2 < mejorD2 && _tieneSalida(i, m)) {
-        mejorD2 = d2;
-        mejor = i;
+    for (var a = 0; a <= maxAnillos; a++) {
+      for (var fr = cr - a; fr <= cr + a; fr++) {
+        if (fr < 0 || fr >= filas) continue;
+        final borde = fr == cr - a || fr == cr + a;
+        final paso = borde ? 1 : 2 * a;
+        for (var co = cc - a; co <= cc + a; co += paso) {
+          if (co >= 0 && co < cols) {
+            final id = fr * cols + co;
+            for (var q = celdaOffs[id]; q < celdaOffs[id + 1]; q++) {
+              final i = celdaNodos[q];
+              final dx = (lons[i] - c.longitude) * kx, dy = (lats[i] - c.latitude) * ky;
+              final d2 = dx * dx + dy * dy;
+              if (d2 < mejorD2 && _tieneSalida(i, m)) {
+                mejorD2 = d2;
+                mejor = i;
+              }
+            }
+          }
+          if (paso == 0) break; // seguridad: a == 0 en fila interior no ocurre, pero evita ciclos infinitos
+        }
       }
+      if (mejor >= 0 && math.sqrt(mejorD2) <= a * celdaM) break;
     }
     return (mejor >= 0 && math.sqrt(mejorD2) <= maxM) ? mejor : -1;
   }
 
+  /// Calles cuyo nombre contiene [norm] (ya normalizado). Cada calle puede traer varios puntos (tramos lejanos).
+  List<({String nombre, double lat, double lon})> buscarCalles(String norm, {int limite = 30}) {
+    final r = <({String nombre, double lat, double lon})>[];
+    if (norm.length < 2) return r;
+    final empiezan = <int>[], contienen = <int>[];
+    for (var i = 0; i < nombresNorm.length; i++) {
+      final t = nombresNorm[i];
+      if (t.startsWith(norm)) {
+        empiezan.add(i);
+      } else if (t.contains(norm)) {
+        contienen.add(i);
+      }
+      if (empiezan.length + contienen.length >= 400) break;
+    }
+    for (final i in [...empiezan, ...contienen]) {
+      for (var q = repOffs[i]; q < repOffs[i + 1]; q++) {
+        final n = repNodos[q];
+        r.add((nombre: nombres[i], lat: lats[n], lon: lons[n]));
+        if (r.length >= limite) return r;
+      }
+    }
+    return r;
+  }
+
+  /// Rumbo aproximado (0..360) entre dos nodos, en plano local (barato: se usa dentro de A*).
+  double _rumbo(int a, int b) {
+    final dLat = lats[b] - lats[a];
+    final dLon = (lons[b] - lons[a]) * math.cos((lats[a] + lats[b]) * 0.5 * math.pi / 180.0);
+    return (math.atan2(dLon, dLat) * 180.0 / math.pi + 360.0) % 360.0;
+  }
+
+  /// Segundos extra por girar en una intersección (en México se circula por la derecha: la izquierda cruza tráfico).
+  double _penalGiro(int a, int b, int c, Modo modo) {
+    final d = Geo.difAng(_rumbo(a, b), _rumbo(b, c));
+    final ad = d.abs();
+    if (modo == Modo.pie || modo == Modo.bici) return ad >= 60 ? 2.0 : 0.0;
+    if (ad < 35) return 0.0;
+    final der = d > 0;
+    if (ad < 70) return der ? 2.0 : 4.0;
+    if (ad < 130) return der ? 5.0 : 10.0;
+    if (ad < 165) return der ? 8.0 : 14.0;
+    return 30.0; // vuelta en U
+  }
+
+  static bool _usaLimite(Modo m) => m == Modo.auto || m == Modo.moto || m == Modo.transporte;
+
+  /// Duración real (sin penalizaciones de preferencia) de una lista de aristas.
+  double duracionAristas(List<int> aristas, Modo modo) {
+    var s = 0.0;
+    final lim = _usaLimite(modo);
+    for (final e in aristas) {
+      var vel = modo.velEnVia(ClaseVia.values[clase[e]]);
+      if (vel <= 0) vel = modo.velProm;
+      if (lim && velMax[e] > 0) vel = math.min(vel, velMax[e] * 0.95);
+      s += dist[e] / (vel / 3.6);
+    }
+    return s;
+  }
+
   /// A* con costo en segundos y heurística = distancia / velocidad máxima del modo.
-  ({List<int> nodos, double seg})? aStar(int origen, int destino, Modo modo) {
-    if (origen == destino) return (nodos: [origen], seg: 0.0);
+  /// Considera límites de velocidad, giros en intersecciones y preferencias (evitar peajes / terracería).
+  /// [penalizadas]: aristas que cuestan más (para generar rutas alternativas).
+  ({List<int> nodos, List<int> aristas})? aStar(int origen, int destino, Modo modo,
+      {bool evitarPeajes = false, bool evitarTerraceria = false, Uint8List? penalizadas}) {
+    if (origen == destino) return (nodos: <int>[origen], aristas: <int>[]);
     final n = lats.length;
     final g = Float64List(n)..fillRange(0, n, double.infinity);
     final previo = Int32List(n)..fillRange(0, n, -1);
+    final viaE = Int32List(n)..fillRange(0, n, -1);
     final cerrado = Uint8List(n);
     final vMax = modo.velMax / 3.6;
     final latD = lats[destino], lonD = lons[destino];
     double h(int i) => Geo.dist(lats[i], lons[i], latD, lonD) / vMax;
     final clases = ClaseVia.values;
+    final lim = _usaLimite(modo);
 
     final cola = _MonticuloMin();
     g[origen] = 0;
@@ -421,23 +562,36 @@ class RedVial {
       final u = cola.sacar();
       if (cerrado[u] == 1) continue;
       if (u == destino) {
-        final camino = <int>[];
+        final nodosR = <int>[];
+        final aristasR = <int>[];
         for (var c = destino; c != -1; c = previo[c]) {
-          camino.add(c);
+          nodosR.add(c);
+          if (viaE[c] >= 0) aristasR.add(viaE[c]);
         }
-        return (nodos: camino.reversed.toList(), seg: g[destino]);
+        return (nodos: nodosR.reversed.toList(), aristas: aristasR.reversed.toList());
       }
       cerrado[u] = 1;
+      final pu = previo[u];
+      final esCruce = offs[u + 1] - offs[u] >= 3;
       for (var e = offs[u]; e < offs[u + 1]; e++) {
         final v = dest[e];
         if (cerrado[v] == 1) continue;
-        if (contra[e] == 1 && !modo.ignoraSentido) continue;
-        final vel = modo.velEnVia(clases[clase[e]]);
+        final bits = contra[e];
+        if ((bits & 1) == 1 && !modo.ignoraSentido) continue;
+        final cls = clases[clase[e]];
+        var vel = modo.velEnVia(cls);
         if (vel <= 0) continue;
-        final nuevo = g[u] + dist[e] / (vel / 3.6);
+        if (lim && velMax[e] > 0) vel = math.min(vel, velMax[e] * 0.95);
+        if (evitarTerraceria && cls == ClaseVia.terraceria) vel = vel / 4;
+        var costo = dist[e] / (vel / 3.6);
+        if (evitarPeajes && (bits & 2) != 0) costo = costo * 2 + 900;
+        if (penalizadas != null && penalizadas[e] == 1) costo *= 1.8;
+        if (pu >= 0 && esCruce) costo += _penalGiro(pu, u, v, modo);
+        final nuevo = g[u] + costo;
         if (nuevo < g[v]) {
           g[v] = nuevo;
           previo[v] = u;
+          viaE[v] = e;
           cola.agregar(nuevo + h(v), v);
         }
       }
@@ -563,6 +717,7 @@ class _ListaF64 {
     _d[length++] = v;
   }
 
+  double operator [](int i) => _d[i];
   Float64List recortar() => _d.sublist(0, length);
 }
 
@@ -577,15 +732,28 @@ Future<bool> _esGeoJsonPorLineas(File f) async {
   }
 }
 
+/// "50", "50 mph", "MX:urban"... → km/h (0 si no se puede interpretar).
+int _parseMaxspeed(String? t) {
+  if (t == null) return 0;
+  final m = RegExp(r'^\s*(\d{1,3})\s*(mph)?').firstMatch(t);
+  if (m == null) return 0;
+  var v = int.parse(m.group(1)!);
+  if (m.group(2) != null) v = (v * 1.609).round();
+  return v.clamp(5, 200);
+}
+
 /// Construye el grafo desde uno o varios GeoJSON de OSM. Se ejecuta en un isolate (no congela la UI).
 /// Los archivos descargados por la app se leen línea por línea (poca memoria); cualquier otro
 /// GeoJSON (p. ej. importado a mano) se carga completo, como antes.
 Future<RedVial> construirRed(List<String> rutas) async {
   final claveANodo = <int, int>{};
   final lats = _ListaF64(), lons = _ListaF64();
-  final ef = _ListaI32(), et = _ListaI32();
-  final ec = _ListaU8(), ek = _ListaU8();
+  final ef = _ListaI32(), et = _ListaI32(), en = _ListaI32();
+  final ec = _ListaU8(), ek = _ListaU8(), ev = _ListaU8();
   final ed = _ListaF32();
+  final idsNombre = <String, int>{};
+  final nombres = <String>[];
+  final reps = <int, List<int>>{};
 
   int nodo(double lat, double lon) {
     final k = ((lat * 1e6).round() + 90000000) * 400000000 + ((lon * 1e6).round() + 180000000);
@@ -598,12 +766,24 @@ Future<RedVial> construirRed(List<String> rutas) async {
     return n;
   }
 
-  void arista(int a, int b, double d, int clase, bool contra) {
+  void arista(int a, int b, double d, int clase, bool contra, bool peaje, int lim, int nombre) {
     ef.add(a);
     et.add(b);
     ed.add(d);
     ec.add(clase);
-    ek.add(contra ? 1 : 0);
+    ek.add((contra ? 1 : 0) | (peaje ? 2 : 0));
+    ev.add(lim);
+    en.add(nombre);
+  }
+
+  // Un nodo representativo por calle y por zona (a >1.5 km de los demás) para buscarla por nombre
+  void representante(int nombre, int nodoId) {
+    final l = reps.putIfAbsent(nombre, () => <int>[]);
+    if (l.length >= 12) return;
+    for (final o in l) {
+      if (Geo.dist(lats[o], lons[o], lats[nodoId], lons[nodoId]) < 1500) return;
+    }
+    l.add(nodoId);
   }
 
   void procesar(dynamic f) {
@@ -621,7 +801,18 @@ Future<RedVial> construirRed(List<String> rutas) async {
         : (ow == '-1' || ow == 'reverse')
             ? 2
             : 0;
+    final nombreCrudo = (props['name'] ?? props['ref'])?.toString().trim() ?? '';
+    var nid = -1;
+    if (nombreCrudo.isNotEmpty) {
+      nid = idsNombre.putIfAbsent(nombreCrudo, () {
+        nombres.add(nombreCrudo);
+        return nombres.length - 1;
+      });
+    }
+    final lim = _parseMaxspeed(props['maxspeed']?.toString());
+    final peaje = props['toll']?.toString() == 'yes';
     _recorrerLineas(geom['coordinates'], (linea) {
+      var primero = -1;
       for (var i = 0; i < linea.length - 1; i++) {
         final a = linea[i], b = linea[i + 1];
         if (a is! List || b is! List || a.length < 2 || b.length < 2) continue;
@@ -629,19 +820,21 @@ Future<RedVial> construirRed(List<String> rutas) async {
         final lonB = (b[0] as num).toDouble(), latB = (b[1] as num).toDouble();
         final ia = nodo(latA, lonA), ib = nodo(latB, lonB);
         if (ia == ib) continue;
+        if (primero < 0) primero = ia;
         final d = Geo.dist(latA, lonA, latB, lonB);
         final ci = claseVia.index;
         if (sentido == 0) {
-          arista(ia, ib, d, ci, false);
-          arista(ib, ia, d, ci, false);
+          arista(ia, ib, d, ci, false, peaje, lim, nid);
+          arista(ib, ia, d, ci, false, peaje, lim, nid);
         } else if (sentido == 1) {
-          arista(ia, ib, d, ci, false);
-          arista(ib, ia, d, ci, true);
+          arista(ia, ib, d, ci, false, peaje, lim, nid);
+          arista(ib, ia, d, ci, true, peaje, lim, nid);
         } else {
-          arista(ib, ia, d, ci, false);
-          arista(ia, ib, d, ci, true);
+          arista(ib, ia, d, ci, false, peaje, lim, nid);
+          arista(ia, ib, d, ci, true, peaje, lim, nid);
         }
       }
+      if (nid >= 0 && primero >= 0) representante(nid, primero);
     });
   }
 
@@ -687,19 +880,100 @@ Future<RedVial> construirRed(List<String> rutas) async {
   final dist = Float32List(m);
   final clase = Uint8List(m);
   final contra = Uint8List(m);
+  final velMax = Uint8List(m);
+  final nombreE = Int32List(m);
   for (var e = 0; e < m; e++) {
     final q = pos[ef[e]]++;
     dest[q] = et[e];
     dist[q] = ed[e];
     clase[q] = ec[e];
     contra[q] = ek[e];
+    velMax[q] = ev[e];
+    nombreE[q] = en[e];
   }
-  return RedVial(lats.recortar(), lons.recortar(), offs, dest, dist, clase, contra);
+  final latsT = lats.recortar(), lonsT = lons.recortar();
+
+  // Índice de cuadrícula (nodo más cercano en tiempo casi constante)
+  var minLat = double.infinity, maxLat = -double.infinity, minLon = double.infinity, maxLon = -double.infinity;
+  for (var i = 0; i < n; i++) {
+    if (latsT[i] < minLat) minLat = latsT[i];
+    if (latsT[i] > maxLat) maxLat = latsT[i];
+    if (lonsT[i] < minLon) minLon = lonsT[i];
+    if (lonsT[i] > maxLon) maxLon = lonsT[i];
+  }
+  var celda = 0.02; // ~2 km
+  while (((maxLat - minLat) / celda + 1) * ((maxLon - minLon) / celda + 1) > 6e6) {
+    celda *= 2;
+  }
+  final filas = ((maxLat - minLat) / celda).floor() + 1;
+  final cols = ((maxLon - minLon) / celda).floor() + 1;
+  final celdaOffs = Int32List(filas * cols + 1);
+  final celdaDe = Int32List(n);
+  for (var i = 0; i < n; i++) {
+    final id = ((latsT[i] - minLat) / celda).floor() * cols + ((lonsT[i] - minLon) / celda).floor();
+    celdaDe[i] = id;
+    celdaOffs[id + 1]++;
+  }
+  for (var i = 0; i < filas * cols; i++) {
+    celdaOffs[i + 1] += celdaOffs[i];
+  }
+  final posC = Int32List.fromList(celdaOffs.sublist(0, filas * cols));
+  final celdaNodos = Int32List(n);
+  for (var i = 0; i < n; i++) {
+    celdaNodos[posC[celdaDe[i]]++] = i;
+  }
+
+  // Calles para el buscador
+  final nombresNorm = <String>[for (final s in nombres) Fmt.normalizar(s)];
+  final repOffs = Int32List(nombres.length + 1);
+  final repLista = <int>[];
+  for (var i = 0; i < nombres.length; i++) {
+    final l = reps[i];
+    if (l != null) repLista.addAll(l);
+    repOffs[i + 1] = repLista.length;
+  }
+
+  return RedVial(
+    lats: latsT,
+    lons: lonsT,
+    offs: offs,
+    dest: dest,
+    dist: dist,
+    clase: clase,
+    contra: contra,
+    velMax: velMax,
+    nombreE: nombreE,
+    nombres: nombres,
+    nombresNorm: nombresNorm,
+    repOffs: repOffs,
+    repNodos: Int32List.fromList(repLista),
+    celdaG: celda,
+    minLat: minLat,
+    minLon: minLon,
+    filas: filas,
+    cols: cols,
+    celdaOffs: celdaOffs,
+    celdaNodos: celdaNodos,
+  );
+}
+
+/// Un tramo de ruta entre dos puntos clave (origen → parada → destino).
+class _Tramo {
+  final List<LatLng> pts;
+  final List<String> calles; // una por segmento
+  final List<int> lims; // una por segmento
+  final double seg;
+  final bool aprox;
+  final List<int> aristas;
+  const _Tramo(this.pts, this.calles, this.lims, this.seg, this.aprox, this.aristas);
 }
 
 /// Motor de enrutamiento local: A* con red vial cargada; línea recta como respaldo.
 class MotorRutas {
   RedVial? red;
+  bool evitarPeajes = false;
+  bool evitarTerraceria = false;
+  List<int> _ultimasAristas = const <int>[];
   static const double _maxAjusteM = 3000;
 
   Future<int> cargar(List<String> rutas) async {
@@ -708,40 +982,128 @@ class MotorRutas {
     return nueva.nodos;
   }
 
-  Future<Ruta> calcular(LatLng o, LatLng d, Modo modo) async {
+  /// Ruta de [o] a [d] pasando por [paradas] (en orden). [nombresParadas] se usa para anunciarlas.
+  Future<Ruta> calcular(LatLng o, LatLng d, Modo modo,
+      {List<LatLng> paradas = const <LatLng>[], List<String> nombresParadas = const <String>[]}) async {
     await Future<void>.delayed(Duration.zero); // deja pintar el indicador de "calculando"
+    final clave = <LatLng>[o, ...paradas, d];
+    final tramos = <_Tramo>[];
+    for (var i = 0; i < clave.length - 1; i++) {
+      tramos.add(_tramo(clave[i], clave[i + 1], modo));
+      if (i < clave.length - 2) await Future<void>.delayed(Duration.zero);
+    }
+    _ultimasAristas = tramos.length == 1 ? tramos.first.aristas : const <int>[];
+    return _unir(tramos, modo, nombresParadas);
+  }
+
+  _Tramo _tramo(LatLng o, LatLng d, Modo modo, {Uint8List? pen}) {
     final r = red;
     if (r != null) {
       final no = r.nodoCercano(o, modo, _maxAjusteM);
       final nd = r.nodoCercano(d, modo, _maxAjusteM);
       if (no >= 0 && nd >= 0) {
-        final camino = r.aStar(no, nd, modo);
+        final camino = r.aStar(no, nd, modo,
+            evitarPeajes: evitarPeajes, evitarTerraceria: evitarTerraceria, penalizadas: pen);
         if (camino != null) {
           final pts = <LatLng>[o];
-          for (final n in camino.nodos) {
+          final calles = <String>[];
+          final lims = <int>[];
+          for (var i = 0; i < camino.nodos.length; i++) {
+            final n = camino.nodos[i];
             final c = LatLng(r.lats[n], r.lons[n]);
-            if (Geo.distLL(pts.last, c) > 0.5) pts.add(c);
+            if (Geo.distLL(pts.last, c) > 0.5) {
+              pts.add(c);
+              if (i == 0) {
+                calles.add('');
+                lims.add(0);
+              } else {
+                final e = camino.aristas[i - 1];
+                final id = r.nombreE[e];
+                calles.add(id >= 0 ? r.nombres[id] : '');
+                lims.add(r.velMax[e]);
+              }
+            }
           }
-          if (Geo.distLL(pts.last, d) > 0.5) pts.add(d);
+          if (Geo.distLL(pts.last, d) > 0.5) {
+            pts.add(d);
+            calles.add('');
+            lims.add(0);
+          }
           final vProm = modo.velProm / 3.6;
-          final extra = (Geo.distLL(o, LatLng(r.lats[camino.nodos.first], r.lons[camino.nodos.first])) +
-                  Geo.distLL(LatLng(r.lats[camino.nodos.last], r.lons[camino.nodos.last]), d)) /
-              vProm;
-          return _armar(pts, camino.seg + extra, false, modo);
+          final primero = LatLng(r.lats[camino.nodos.first], r.lons[camino.nodos.first]);
+          final ultimo = LatLng(r.lats[camino.nodos.last], r.lons[camino.nodos.last]);
+          final extra = (Geo.distLL(o, primero) + Geo.distLL(ultimo, d)) / vProm;
+          return _Tramo(pts, calles, lims, r.duracionAristas(camino.aristas, modo) + extra, false, camino.aristas);
         }
       }
     }
     final dist = Geo.distLL(o, d);
-    return _armar([o, d], dist / (modo.velProm / 3.6), true, modo);
+    return _Tramo(<LatLng>[o, d], <String>[''], <int>[0], dist / (modo.velProm / 3.6), true, const <int>[]);
   }
 
-  Ruta _armar(List<LatLng> entrada, double seg, bool aprox, Modo modo) {
-    final pts = entrada.length < 2 ? [entrada[0], entrada[0]] : entrada;
+  Ruta _unir(List<_Tramo> tramos, Modo modo, List<String> nombresParadas) {
+    final pts = <LatLng>[];
+    final calles = <String>[];
+    final lims = <int>[];
+    final paradas = <int, String>{};
+    var seg = 0.0;
+    for (var t = 0; t < tramos.length; t++) {
+      final tr = tramos[t];
+      seg += tr.seg;
+      if (pts.isEmpty) {
+        pts.addAll(tr.pts);
+      } else {
+        pts.addAll(tr.pts.skip(1)); // el primer punto coincide con la parada anterior
+      }
+      calles.addAll(tr.calles);
+      lims.addAll(tr.lims);
+      if (t < tramos.length - 1) {
+        final nombre = t < nombresParadas.length ? nombresParadas[t] : '';
+        paradas[pts.length - 1] = 'la parada ${t + 1}${nombre.isEmpty ? '' : ', $nombre'}';
+      }
+    }
+    return _armar(pts, seg, tramos.every((t) => t.aprox), modo, calles, lims, paradas);
+  }
+
+  Ruta _armar(List<LatLng> entrada, double seg, bool aprox, Modo modo, List<String> calles, List<int> lims,
+      Map<int, String> paradas) {
+    final pts = entrada.length < 2 ? <LatLng>[entrada[0], entrada[0]] : entrada;
     final acum = List<double>.filled(pts.length, 0);
     for (var i = 1; i < pts.length; i++) {
       acum[i] = acum[i - 1] + Geo.distLL(pts[i - 1], pts[i]);
     }
-    return Ruta(pts, acum, acum.last, seg, generarManiobras(pts, acum), aprox, modo);
+    return Ruta(pts, acum, acum.last, seg, generarManiobras(pts, acum, calles: calles, paradas: paradas), aprox, modo,
+        limiteSeg: lims, calleSeg: calles);
+  }
+
+  /// Hasta 2 alternativas a la última ruta calculada (solo de un tramo): penaliza las vías ya usadas y recalcula.
+  Future<List<Ruta>> alternativas(LatLng o, LatLng d, Modo modo, Ruta mejor) async {
+    final r = red;
+    if (r == null || mejor.aproximada || _ultimasAristas.isEmpty) return <Ruta>[];
+    final usadas = Uint8List(r.dest.length);
+    final base = <int>{};
+    for (final e in _ultimasAristas) {
+      usadas[e] = 1;
+      base.add(e);
+    }
+    final res = <Ruta>[];
+    for (var k = 0; k < 2; k++) {
+      await Future<void>.delayed(Duration.zero);
+      final t = _tramo(o, d, modo, pen: usadas);
+      if (t.aprox || t.aristas.isEmpty) break;
+      var compartidas = 0;
+      for (final e in t.aristas) {
+        if (base.contains(e)) compartidas++;
+      }
+      if (compartidas / t.aristas.length > 0.85) break; // casi igual: no sirve como alternativa
+      if (t.seg > mejor.duracionS * 1.8 + 120) break; // mucho más lenta
+      res.add(_unir(<_Tramo>[t], modo, const <String>[]));
+      for (final e in t.aristas) {
+        usadas[e] = 1;
+        base.add(e);
+      }
+    }
+    return res;
   }
 }
 
@@ -1574,6 +1936,11 @@ class DescargadorRed {
             if (ow != null) linea.write(',"oneway":${jsonEncode('$ow')}');
             final jn = tags['junction'];
             if (jn != null) linea.write(',"junction":${jsonEncode('$jn')}');
+            final nom = tags['name'] ?? tags['ref'];
+            if (nom != null) linea.write(',"name":${jsonEncode('$nom')}');
+            final ms = tags['maxspeed'];
+            if (ms != null) linea.write(',"maxspeed":${jsonEncode('$ms')}');
+            if ('${tags['toll']}' == 'yes') linea.write(',"toll":"yes"');
             linea.write('},"geometry":{"type":"LineString","coordinates":[$coords]}}');
             sink.writeln(linea.toString());
             vias++;
