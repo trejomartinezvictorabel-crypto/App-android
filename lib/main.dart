@@ -1522,53 +1522,812 @@ Cmd interpretarComando(String original) {
 }
 
 // ============================================================================
-// 7. MAPA OFFLINE: PROVEEDOR DE TESELAS MBTILES (RASTER)
+// 7. MAPA OFFLINE: PROVEEDOR DE TESELAS MBTILES (RASTER Y VECTORIAL)
 // ============================================================================
 //
-//  CAUSA DEL FONDO MORADO: antes, cuando una tesela no existía, se devolvía un PNG de 1x1 que en
-//  realidad era un píxel AZUL semitransparente. Al estirarse a toda la pantalla sobre el fondo gris
-//  daba exactamente ese morado. Ahora la tesela vacía es un píxel 100 % TRANSPARENTE (se ve el
-//  fondo gris) y nunca se lanza una excepción que rompa el renderizado.
+//  Tesela vacía = píxel 100 % TRANSPARENTE (se ve el fondo gris); nunca se lanza una excepción
+//  que rompa el renderizado.
 
-/// Tesela sin datos: 1x1 RGBA totalmente transparente (píxeles crudos, sin PNG de por medio).
 Future<ui.Codec> _codecTransparente() async {
   final buffer = await ui.ImmutableBuffer.fromUint8List(Uint8List(4)); // R,G,B,A = 0
   final descriptor = ui.ImageDescriptor.raw(buffer, width: 1, height: 1, pixelFormat: ui.PixelFormat.rgba8888);
   return descriptor.instantiateCodec();
 }
 
+// ----------------------------------------------------------------------------
+//  MAPAS VECTORIALES (.mbtiles con teselas pbf / Mapbox Vector Tile)
+//  Sin paquetes extra: se decodifica el protobuf y se dibuja con dart:ui en una imagen
+//  por tesela, que flutter_map muestra igual que una tesela raster. Más allá del zoom
+//  máximo del archivo se re-dibuja la tesela madre ampliada (los trazos siguen nítidos).
+//  Esquema esperado: OpenMapTiles (water, landcover, landuse, transportation, building,
+//  boundary, place, transportation_name); también reconoce nombres de capas tipo Shortbread.
+// ----------------------------------------------------------------------------
+
+class _Pb {
+  final Uint8List b;
+  int p = 0;
+  final int fin;
+  _Pb(this.b) : fin = b.length;
+
+  bool get hay => p < fin;
+
+  int varint() {
+    var r = 0, s = 0;
+    while (true) {
+      if (p >= fin) throw const FormatException('protobuf truncado');
+      final x = b[p++];
+      r |= (x & 0x7F) << s;
+      if (x < 0x80) return r;
+      s += 7;
+      if (s > 63) throw const FormatException('varint inválido');
+    }
+  }
+
+  Uint8List bytesLen() {
+    final n = varint();
+    if (n < 0 || p + n > fin) throw const FormatException('longitud inválida');
+    final r = Uint8List.sublistView(b, p, p + n);
+    p += n;
+    return r;
+  }
+
+  void saltar(int wire) {
+    switch (wire) {
+      case 0:
+        varint();
+      case 1:
+        p += 8;
+      case 2:
+        bytesLen();
+      case 5:
+        p += 4;
+      default:
+        throw const FormatException('tipo de campo desconocido');
+    }
+  }
+
+  double float32() {
+    final v = ByteData.sublistView(b, p, p + 4).getFloat32(0, Endian.little);
+    p += 4;
+    return v;
+  }
+
+  double float64() {
+    final v = ByteData.sublistView(b, p, p + 8).getFloat64(0, Endian.little);
+    p += 8;
+    return v;
+  }
+}
+
+class _FeatVec {
+  final int tipo; // 1 = punto, 2 = línea, 3 = polígono
+  final Map<String, Object> props;
+  final List<Float32List> partes; // [x0, y0, x1, y1, ...] en unidades de la tesela
+  const _FeatVec(this.tipo, this.props, this.partes);
+}
+
+class _CapaVec {
+  final String nombre;
+  final int extent;
+  final List<_FeatVec> feats;
+  const _CapaVec(this.nombre, this.extent, this.feats);
+}
+
+int _zigzag(int v) => (v >> 1) ^ -(v & 1);
+
+Uint8List _descomprimirTesela(Uint8List d) {
+  if (d.length > 2 && d[0] == 0x1f && d[1] == 0x8b) return Uint8List.fromList(gzip.decode(d));
+  return d;
+}
+
+List<_CapaVec> _decodificarMvt(Uint8List datos) {
+  final capas = <_CapaVec>[];
+  final t = _Pb(datos);
+  while (t.hay) {
+    final tag = t.varint();
+    if ((tag >> 3) == 3 && (tag & 7) == 2) {
+      capas.add(_decodificarCapa(t.bytesLen()));
+    } else {
+      t.saltar(tag & 7);
+    }
+  }
+  return capas;
+}
+
+Object _decodificarValor(Uint8List d) {
+  final r = _Pb(d);
+  Object v = '';
+  while (r.hay) {
+    final tag = r.varint();
+    switch (tag >> 3) {
+      case 1:
+        v = utf8.decode(r.bytesLen(), allowMalformed: true);
+      case 2:
+        v = r.float32();
+      case 3:
+        v = r.float64();
+      case 4:
+      case 5:
+        v = r.varint();
+      case 6:
+        v = _zigzag(r.varint());
+      case 7:
+        v = r.varint() != 0;
+      default:
+        r.saltar(tag & 7);
+    }
+  }
+  return v;
+}
+
+_CapaVec _decodificarCapa(Uint8List d) {
+  final r = _Pb(d);
+  var nombre = '';
+  var extent = 4096;
+  final claves = <String>[];
+  final valores = <Object>[];
+  final crudas = <Uint8List>[];
+  while (r.hay) {
+    final tag = r.varint();
+    switch (tag >> 3) {
+      case 1:
+        nombre = utf8.decode(r.bytesLen(), allowMalformed: true);
+      case 2:
+        crudas.add(r.bytesLen());
+      case 3:
+        claves.add(utf8.decode(r.bytesLen(), allowMalformed: true));
+      case 4:
+        valores.add(_decodificarValor(r.bytesLen()));
+      case 5:
+        extent = r.varint();
+      default:
+        r.saltar(tag & 7);
+    }
+  }
+  final feats = <_FeatVec>[];
+  for (final c in crudas) {
+    final f = _decodificarFeature(c, claves, valores);
+    if (f != null) feats.add(f);
+  }
+  return _CapaVec(nombre, extent <= 0 ? 4096 : extent, feats);
+}
+
+_FeatVec? _decodificarFeature(Uint8List d, List<String> claves, List<Object> valores) {
+  final r = _Pb(d);
+  var tipo = 0;
+  Uint8List? tags;
+  Uint8List? geom;
+  while (r.hay) {
+    final tag = r.varint();
+    switch (tag >> 3) {
+      case 2:
+        tags = r.bytesLen();
+      case 3:
+        tipo = r.varint();
+      case 4:
+        geom = r.bytesLen();
+      default:
+        r.saltar(tag & 7);
+    }
+  }
+  if (geom == null || tipo < 1 || tipo > 3) return null;
+
+  final props = <String, Object>{};
+  if (tags != null) {
+    final tg = _Pb(tags);
+    while (tg.hay) {
+      final k = tg.varint();
+      if (!tg.hay) break;
+      final v = tg.varint();
+      if (k < claves.length && v < valores.length) props[claves[k]] = valores[v];
+    }
+  }
+
+  final partes = <Float32List>[];
+  var actual = <double>[];
+  void cerrarParte() {
+    if (actual.isNotEmpty) partes.add(Float32List.fromList(actual));
+    actual = <double>[];
+  }
+
+  final g = _Pb(geom);
+  var x = 0, y = 0;
+  while (g.hay) {
+    final cmd = g.varint();
+    final id = cmd & 7;
+    final n = cmd >> 3;
+    if (id == 1 || id == 2) {
+      for (var i = 0; i < n; i++) {
+        x += _zigzag(g.varint());
+        y += _zigzag(g.varint());
+        if (id == 1) {
+          if (tipo == 1) {
+            partes.add(Float32List.fromList(<double>[x.toDouble(), y.toDouble()]));
+            continue;
+          }
+          cerrarParte(); // nueva línea o nuevo anillo
+        }
+        actual.add(x.toDouble());
+        actual.add(y.toDouble());
+      }
+    } else if (id == 7) {
+      if (actual.length >= 2) {
+        actual.add(actual[0]);
+        actual.add(actual[1]);
+      }
+      cerrarParte();
+    } else {
+      throw const FormatException('comando de geometría desconocido');
+    }
+  }
+  cerrarParte();
+  return _FeatVec(tipo, props, partes);
+}
+
+// ---------------------------------------------------------------- dibujo
+const int _pxTesela = 512; // lado de la imagen que se dibuja (el doble de 256: nítido en pantallas densas)
+
+int _categoriaCapa(String n) {
+  switch (n) {
+    case 'landcover':
+    case 'landuse':
+    case 'park':
+    case 'natural':
+    case 'land':
+    case 'landuse_overlay':
+    case 'green':
+      return 1;
+    case 'water':
+    case 'water_polygons':
+    case 'ocean':
+    case 'water_areas':
+      return 2;
+    case 'waterway':
+    case 'water_lines':
+    case 'waterway_lines':
+      return 3;
+    case 'building':
+    case 'buildings':
+      return 4;
+    case 'transportation':
+    case 'roads':
+    case 'streets':
+    case 'road':
+      return 5;
+    case 'boundary':
+    case 'boundaries':
+    case 'admin':
+      return 6;
+    case 'place':
+    case 'places':
+    case 'place_labels':
+      return 7;
+    case 'transportation_name':
+    case 'street_labels':
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+String _claseDe(_FeatVec f) => '${f.props['class'] ?? f.props['kind'] ?? f.props['subclass'] ?? f.props['highway'] ?? ''}';
+
+String _nombreDe(_FeatVec f) {
+  final v = f.props['name:es'] ?? f.props['name_es'] ?? f.props['name:latin'] ?? f.props['name'];
+  return v == null ? '' : '$v';
+}
+
+ui.Color? _colorSuelo(String clase) {
+  final c = clase.toLowerCase();
+  if (c.contains('wood') || c.contains('forest')) return const ui.Color(0xFFCDE5BB);
+  if (c.contains('park') ||
+      c.contains('garden') ||
+      c.contains('grass') ||
+      c.contains('meadow') ||
+      c.contains('recreation') ||
+      c.contains('nature') ||
+      c.contains('scrub') ||
+      c.contains('golf')) {
+    return const ui.Color(0xFFD3EBC4);
+  }
+  if (c.contains('farm') || c.contains('agri') || c.contains('orchard') || c.contains('vineyard')) {
+    return const ui.Color(0xFFEEF0D5);
+  }
+  if (c.contains('residential')) return const ui.Color(0xFFEAE6DE);
+  if (c.contains('industrial') || c.contains('commercial') || c.contains('retail')) return const ui.Color(0xFFE6E0E8);
+  if (c.contains('sand') || c.contains('beach') || c.contains('desert')) return const ui.Color(0xFFF3E7C3);
+  if (c.contains('cemetery')) return const ui.Color(0xFFCFE0C9);
+  if (c.contains('hospital')) return const ui.Color(0xFFF3DEDC);
+  if (c.contains('school') || c.contains('university') || c.contains('college')) return const ui.Color(0xFFF0E9CC);
+  if (c.contains('pitch') || c.contains('sport') || c.contains('stadium')) return const ui.Color(0xFFCFEBD0);
+  if (c.contains('ice') || c.contains('glacier')) return const ui.Color(0xFFFFFFFF);
+  return null;
+}
+
+/// 5 autopista/troncal, 4 primaria, 3 secundaria, 2 terciaria, 1 calle local, 0 vereda/terracería, -1 ferrocarril, -9 omitir.
+int _rangoVia(String c) {
+  switch (c) {
+    case 'motorway':
+    case 'trunk':
+    case 'motorway_link':
+    case 'trunk_link':
+      return 5;
+    case 'primary':
+    case 'primary_link':
+      return 4;
+    case 'secondary':
+    case 'secondary_link':
+      return 3;
+    case 'tertiary':
+    case 'tertiary_link':
+      return 2;
+    case 'path':
+    case 'footway':
+    case 'pedestrian':
+    case 'steps':
+    case 'cycleway':
+    case 'bridleway':
+    case 'track':
+      return 0;
+    case 'rail':
+    case 'transit':
+    case 'subway':
+    case 'light_rail':
+    case 'tram':
+      return -1;
+    case 'ferry':
+    case 'aerialway':
+    case 'aeroway':
+    case 'construction':
+    case 'proposed':
+      return -9;
+    default:
+      return 1;
+  }
+}
+
+void _agregarTrazos(ui.Path p, _FeatVec f, double k, double ox, double oy, {required bool cerrar}) {
+  for (final parte in f.partes) {
+    if (parte.length < 4) continue;
+    p.moveTo(parte[0] * k - ox, parte[1] * k - oy);
+    for (var i = 2; i + 1 < parte.length; i += 2) {
+      p.lineTo(parte[i] * k - ox, parte[i + 1] * k - oy);
+    }
+    if (cerrar) p.close();
+  }
+}
+
+/// ¿Todo el objeto cae fuera de la imagen? (solo importa al ampliar una tesela madre)
+bool _fueraDeImagen(_FeatVec f, double k, double ox, double oy) {
+  var minX = double.infinity, minY = double.infinity, maxX = -double.infinity, maxY = -double.infinity;
+  for (final parte in f.partes) {
+    for (var i = 0; i + 1 < parte.length; i += 2) {
+      final x = parte[i] * k - ox, y = parte[i + 1] * k - oy;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  const m = 80.0;
+  return maxX < -m || minX > _pxTesela + m || maxY < -m || minY > _pxTesela + m;
+}
+
+ui.Paragraph _parrafo(String t, double tam, {ui.Paint? contorno, ui.Color? color, bool negrita = false}) {
+  final b = ui.ParagraphBuilder(ui.ParagraphStyle(textAlign: ui.TextAlign.center, maxLines: 2))
+    ..pushStyle(ui.TextStyle(
+      color: contorno == null ? color : null,
+      foreground: contorno,
+      fontSize: tam,
+      fontWeight: negrita ? ui.FontWeight.w700 : ui.FontWeight.w500,
+    ))
+    ..addText(t);
+  final p = b.build();
+  p.layout(const ui.ParagraphConstraints(width: 300));
+  return p;
+}
+
+class _EstiloLugar {
+  final double tam;
+  final bool negrita;
+  const _EstiloLugar(this.tam, this.negrita);
+}
+
+_EstiloLugar? _estiloLugar(String c, int z) {
+  switch (c) {
+    case 'country':
+      return z >= 3 && z <= 6 ? const _EstiloLugar(26, true) : null;
+    case 'state':
+    case 'region':
+      return z >= 5 && z <= 8 ? const _EstiloLugar(22, true) : null;
+    case 'city':
+      return z >= 4 ? const _EstiloLugar(30, true) : null;
+    case 'town':
+      return z >= 8 ? const _EstiloLugar(26, true) : null;
+    case 'village':
+      return z >= 10 ? const _EstiloLugar(22, false) : null;
+    case 'suburb':
+    case 'quarter':
+    case 'neighbourhood':
+    case 'hamlet':
+    case 'locality':
+      return z >= 13 ? const _EstiloLugar(20, false) : null;
+    default:
+      return null;
+  }
+}
+
+class _EtiquetaLugar {
+  final num rango;
+  final String nombre;
+  final double x, y;
+  final _EstiloLugar estilo;
+  const _EtiquetaLugar(this.rango, this.nombre, this.x, this.y, this.estilo);
+}
+
+/// Dibuja una tesela vectorial. [zDatos] = zoom de los datos; [d] = niveles de ampliación sobre ellos;
+/// ([sx], [sy]) = cuál sub-tesela de la madre se muestra (0 cuando d == 0).
+Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int sx, int sy) async {
+  final z = zDatos + d;
+  final escala = (1 << d).toDouble();
+  final ox = sx * _pxTesela.toDouble(), oy = sy * _pxTesela.toDouble();
+  final rec = ui.PictureRecorder();
+  final canvas = ui.Canvas(rec, ui.Rect.fromLTWH(0, 0, _pxTesela.toDouble(), _pxTesela.toDouble()));
+  canvas.drawRect(ui.Rect.fromLTWH(0, 0, _pxTesela.toDouble(), _pxTesela.toDouble()),
+      ui.Paint()..color = const ui.Color(0xFFF2EFE9));
+  final recortar = d > 0;
+
+  double kDe(_CapaVec c) => _pxTesela * escala / c.extent;
+  final relleno = ui.Paint()..style = ui.PaintingStyle.fill;
+  final trazo = ui.Paint()
+    ..style = ui.PaintingStyle.stroke
+    ..strokeCap = ui.StrokeCap.round
+    ..strokeJoin = ui.StrokeJoin.round;
+
+  // 1) suelo (parques, bosques, uso de suelo): un trazado por color
+  final suelo = <ui.Color, ui.Path>{};
+  for (final capa in capas) {
+    if (_categoriaCapa(capa.nombre) != 1) continue;
+    final k = kDe(capa);
+    for (final f in capa.feats) {
+      if (f.tipo != 3) continue;
+      final col = _colorSuelo(_claseDe(f));
+      if (col == null) continue;
+      if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
+      final p = suelo.putIfAbsent(col, () => ui.Path()..fillType = ui.PathFillType.evenOdd);
+      _agregarTrazos(p, f, k, ox, oy, cerrar: true);
+    }
+  }
+  suelo.forEach((col, p) => canvas.drawPath(p, relleno..color = col));
+
+  // 2) agua
+  const colAgua = ui.Color(0xFFA9D3E8);
+  final agua = ui.Path()..fillType = ui.PathFillType.evenOdd;
+  for (final capa in capas) {
+    if (_categoriaCapa(capa.nombre) != 2) continue;
+    final k = kDe(capa);
+    for (final f in capa.feats) {
+      if (f.tipo != 3) continue;
+      if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
+      _agregarTrazos(agua, f, k, ox, oy, cerrar: true);
+    }
+  }
+  canvas.drawPath(agua, relleno..color = colAgua);
+
+  // 3) ríos y arroyos
+  final rios = ui.Path();
+  for (final capa in capas) {
+    if (_categoriaCapa(capa.nombre) != 3) continue;
+    final k = kDe(capa);
+    for (final f in capa.feats) {
+      if (f.tipo != 2) continue;
+      final c = _claseDe(f);
+      if (z < 11 && c != 'river') continue;
+      if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
+      _agregarTrazos(rios, f, k, ox, oy, cerrar: false);
+    }
+  }
+  canvas.drawPath(
+      rios,
+      trazo
+        ..color = colAgua
+        ..strokeWidth = (z < 11 ? 1.6 : 2.6) * 2);
+
+  // 4) edificios (solo con zoom alto)
+  if (z >= 15) {
+    final edif = ui.Path()..fillType = ui.PathFillType.evenOdd;
+    for (final capa in capas) {
+      if (_categoriaCapa(capa.nombre) != 4) continue;
+      final k = kDe(capa);
+      for (final f in capa.feats) {
+        if (f.tipo != 3) continue;
+        if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
+        _agregarTrazos(edif, f, k, ox, oy, cerrar: true);
+      }
+    }
+    canvas.drawPath(edif, relleno..color = const ui.Color(0xFFDDD6CE));
+    if (z >= 16) {
+      canvas.drawPath(
+          edif,
+          trazo
+            ..color = const ui.Color(0xFFC9BFB5)
+            ..strokeWidth = 1.6);
+    }
+  }
+
+  // 5) límites político-administrativos (estado y país)
+  final lim = ui.Path();
+  for (final capa in capas) {
+    if (_categoriaCapa(capa.nombre) != 6) continue;
+    final k = kDe(capa);
+    for (final f in capa.feats) {
+      if (f.tipo != 2) continue;
+      final nivel = f.props['admin_level'];
+      if (nivel is num && nivel > 4) continue;
+      if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
+      _agregarTrazos(lim, f, k, ox, oy, cerrar: false);
+    }
+  }
+  canvas.drawPath(
+      lim,
+      trazo
+        ..color = const ui.Color(0xFF9A8FB5)
+        ..strokeWidth = 3);
+
+  // 6) vías: por rango, de menor a mayor importancia
+  final porRango = <int, ui.Path>{};
+  final minRango = z < 6 ? 5 : (z < 9 ? 4 : (z < 11 ? 3 : (z < 13 ? 2 : (z < 14 ? 1 : 0))));
+  for (final capa in capas) {
+    if (_categoriaCapa(capa.nombre) != 5) continue;
+    final k = kDe(capa);
+    for (final f in capa.feats) {
+      if (f.tipo != 2) continue;
+      final c = _claseDe(f);
+      final rango = _rangoVia(c);
+      if (rango == -9) continue;
+      if (rango == -1) {
+        if (z < 10) continue;
+      } else {
+        if (rango < minRango) continue;
+        if (rango == 0 && z < 15) continue;
+        if (c == 'service' && z < 15) continue;
+      }
+      if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
+      _agregarTrazos(porRango.putIfAbsent(rango, () => ui.Path()), f, k, ox, oy, cerrar: false);
+    }
+  }
+  final factor = math.max(0.35, math.min(4.0, math.pow(2, (z - 14) * 0.55).toDouble()));
+  const anchos = <int, double>{5: 5.0, 4: 4.5, 3: 4.0, 2: 3.5, 1: 2.8, 0: 1.3, -1: 1.2};
+  const rellenos = <int, ui.Color>{
+    5: ui.Color(0xFFF5A56E),
+    4: ui.Color(0xFFFBD38D),
+    3: ui.Color(0xFFF8F0A8),
+    2: ui.Color(0xFFFFFFFF),
+    1: ui.Color(0xFFFFFFFF),
+    0: ui.Color(0xFF9C8F7A),
+    -1: ui.Color(0xFF8A8A8A),
+  };
+  const bordes = <int, ui.Color>{
+    5: ui.Color(0xFFC1693C),
+    4: ui.Color(0xFFC9A24D),
+    3: ui.Color(0xFFB5B08A),
+    2: ui.Color(0xFFBDBDBD),
+    1: ui.Color(0xFFCFCFCF),
+  };
+  final orden = porRango.keys.toList()..sort();
+  for (final r in orden) {
+    final p = porRango[r]!;
+    final w = (anchos[r] ?? 2.0) * 2 * factor;
+    final borde = bordes[r];
+    if (borde != null && z >= 11) {
+      canvas.drawPath(
+          p,
+          trazo
+            ..color = borde
+            ..strokeWidth = w + 3);
+    }
+    canvas.drawPath(
+        p,
+        trazo
+          ..color = rellenos[r] ?? const ui.Color(0xFFFFFFFF)
+          ..strokeWidth = w);
+  }
+
+  // 7) etiquetas con anti-choques: lugares primero, luego nombres de calles
+  final ocupados = <ui.Rect>[];
+  final halo = ui.Paint()
+    ..style = ui.PaintingStyle.stroke
+    ..strokeWidth = 4
+    ..color = const ui.Color(0xCCFFFFFF);
+  const colTexto = ui.Color(0xFF333333);
+
+  bool libre(ui.Rect r) {
+    for (final o in ocupados) {
+      if (o.overlaps(r)) return false;
+    }
+    return true;
+  }
+
+  final lugares = <_EtiquetaLugar>[];
+  for (final capa in capas) {
+    if (_categoriaCapa(capa.nombre) != 7) continue;
+    final k = kDe(capa);
+    for (final f in capa.feats) {
+      if (f.tipo != 1 || f.partes.isEmpty) continue;
+      final nombre = _nombreDe(f);
+      if (nombre.isEmpty) continue;
+      final est = _estiloLugar(_claseDe(f), z);
+      if (est == null) continue;
+      final px = f.partes.first[0] * k - ox, py = f.partes.first[1] * k - oy;
+      if (px < 0 || px > _pxTesela || py < 0 || py > _pxTesela) continue;
+      final rango = f.props['rank'];
+      lugares.add(_EtiquetaLugar(rango is num ? rango : 50, nombre, px, py, est));
+    }
+  }
+  lugares.sort((a, b) => a.rango.compareTo(b.rango));
+  for (final l in lugares) {
+    final fondo = _parrafo(l.nombre, l.estilo.tam, contorno: halo, negrita: l.estilo.negrita);
+    final texto = _parrafo(l.nombre, l.estilo.tam, color: colTexto, negrita: l.estilo.negrita);
+    final caja = ui.Rect.fromCenter(
+        center: ui.Offset(l.x, l.y), width: texto.longestLine + 8, height: texto.height + 4);
+    if (!libre(caja)) continue;
+    ocupados.add(caja);
+    canvas.drawParagraph(fondo, ui.Offset(l.x - 150, l.y - fondo.height / 2));
+    canvas.drawParagraph(texto, ui.Offset(l.x - 150, l.y - texto.height / 2));
+  }
+
+  if (z >= 15) {
+    final usados = <String, int>{};
+    for (final capa in capas) {
+      final cat = _categoriaCapa(capa.nombre);
+      if (cat != 8 && cat != 5) continue;
+      final k = kDe(capa);
+      for (final f in capa.feats) {
+        if (f.tipo != 2 || f.partes.isEmpty) continue;
+        final nombre = _nombreDe(f);
+        if (nombre.isEmpty || (usados[nombre] ?? 0) >= 2) continue;
+        // parte más larga y su punto medio
+        Float32List? mejor;
+        for (final p in f.partes) {
+          if (mejor == null || p.length > mejor.length) mejor = p;
+        }
+        if (mejor == null || mejor.length < 4) continue;
+        final n = mejor.length ~/ 2;
+        var largo = 0.0;
+        for (var i = 1; i < n; i++) {
+          largo += math.sqrt(math.pow(mejor[2 * i] - mejor[2 * i - 2], 2) + math.pow(mejor[2 * i + 1] - mejor[2 * i - 1], 2)) * k;
+        }
+        final texto = _parrafo(nombre, 18, color: const ui.Color(0xFF555555));
+        if (largo < texto.longestLine * 1.15) continue;
+        var acum = 0.0;
+        var mx = 0.0, my = 0.0, ang = 0.0;
+        for (var i = 1; i < n; i++) {
+          final ax = mejor[2 * i - 2] * k - ox, ay = mejor[2 * i - 1] * k - oy;
+          final bx = mejor[2 * i] * k - ox, by = mejor[2 * i + 1] * k - oy;
+          final seg = math.sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+          if (acum + seg >= largo / 2) {
+            final t = seg <= 0 ? 0.0 : (largo / 2 - acum) / seg;
+            mx = ax + (bx - ax) * t;
+            my = ay + (by - ay) * t;
+            ang = math.atan2(by - ay, bx - ax);
+            break;
+          }
+          acum += seg;
+        }
+        if (mx < 0 || mx > _pxTesela || my < 0 || my > _pxTesela) continue;
+        if (ang > math.pi / 2) ang -= math.pi;
+        if (ang < -math.pi / 2) ang += math.pi;
+        final lado = math.max(texto.longestLine, texto.height) + 6;
+        final caja = ui.Rect.fromCenter(center: ui.Offset(mx, my), width: lado, height: lado);
+        if (!libre(caja)) continue;
+        ocupados.add(caja);
+        usados[nombre] = (usados[nombre] ?? 0) + 1;
+        final fondo = _parrafo(nombre, 18, contorno: halo);
+        canvas.save();
+        canvas.translate(mx, my);
+        canvas.rotate(ang);
+        canvas.drawParagraph(fondo, ui.Offset(-150, -fondo.height / 2));
+        canvas.drawParagraph(texto, ui.Offset(-150, -texto.height / 2));
+        canvas.restore();
+      }
+    }
+  }
+
+  final imagen = await rec.endRecording().toImage(_pxTesela, _pxTesela);
+  return imagen;
+}
+
+// ---------------------------------------------------------------- proveedor de teselas
+
 class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
   final List<Database> bases;
+  final List<bool> vectorial; // por base: true = teselas pbf
+  final List<int> zMaxBase; // por base: zoom máximo con datos
   final int x, y, z;
-  const _ImagenMbTile(this.bases, this.x, this.y, this.z);
+  const _ImagenMbTile(this.bases, this.vectorial, this.zMaxBase, this.x, this.y, this.z);
+
+  // Teselas vectoriales ya decodificadas (las sub-teselas ampliadas comparten la madre) y cola de dibujo
+  static final Map<String, List<_CapaVec>> _cache = <String, List<_CapaVec>>{};
+  static Future<void> _turno = Future<void>.value();
+
+  /// Dibuja de una en una y cede el hilo entre teselas para que la interfaz no se trabe.
+  static Future<T> _enCola<T>(Future<T> Function() trabajo) {
+    final completer = Completer<T>();
+    _turno = _turno.then((_) async {
+      try {
+        completer.complete(await trabajo());
+      } catch (e, s) {
+        completer.completeError(e, s);
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    });
+    return completer.future;
+  }
 
   /// Lee la tesela de la tabla `tiles` (zoom_level, tile_column, tile_row, tile_data).
-  Future<Uint8List?> _leer() async {
+  Future<Uint8List?> _leer(Database db, int zz, int xx, int yy) async {
     // MBTiles usa esquema TMS (Y invertida); flutter_map usa XYZ  →  y_tms = (1 << z) - 1 - y
-    final fila = (1 << z) - 1 - y;
-    for (final db in bases) {
-      try {
-        final r = await db.rawQuery(
-            'SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ? LIMIT 1',
-            [z, x, fila]);
-        if (r.isNotEmpty) {
-          final d = r.first['tile_data'];
-          if (d is Uint8List && d.isNotEmpty) return d;
-        }
-      } catch (_) {}
-    }
+    final fila = (1 << zz) - 1 - yy;
+    try {
+      final r = await db.rawQuery(
+          'SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ? LIMIT 1',
+          [zz, xx, fila]);
+      if (r.isNotEmpty) {
+        final d = r.first['tile_data'];
+        if (d is Uint8List && d.isNotEmpty) return d;
+      }
+    } catch (_) {}
     return null; // no existe en la base offline
   }
 
-  Future<ui.Codec> _decodificar(ImageDecoderCallback decode) async {
+  Future<ui.Image> _transparente() async {
+    final codec = await _codecTransparente();
+    final frame = await codec.getNextFrame();
+    codec.dispose();
+    return frame.image;
+  }
+
+  Future<ui.Image?> _vectorialDe(int i) {
+    final zb = zMaxBase[i];
+    final d = z > zb ? z - zb : 0;
+    if (d > 6) return Future<ui.Image?>.value(null);
+    final zd = z - d;
+    final xd = x >> d, yd = y >> d;
+    final sx = x & ((1 << d) - 1), sy = y & ((1 << d) - 1);
+    return _enCola<ui.Image?>(() async {
+      final clave = '$i/$zd/$xd/$yd';
+      var capas = _cache.remove(clave); // se reinserta al final: así el más antiguo es el primero
+      if (capas == null) {
+        final datos = await _leer(bases[i], zd, xd, yd);
+        if (datos == null) return null;
+        capas = _decodificarMvt(_descomprimirTesela(datos));
+      }
+      _cache[clave] = capas;
+      if (_cache.length > 20) _cache.remove(_cache.keys.first);
+      return _dibujarVectorial(capas, zd, d, sx, sy);
+    });
+  }
+
+  Future<ImageInfo> _cargar(ImageDecoderCallback decode) async {
     try {
-      final datos = await _leer();
-      if (datos == null) return _codecTransparente();
-      final buffer = await ui.ImmutableBuffer.fromUint8List(datos);
-      return await decode(buffer); // el await permite atrapar datos corruptos
-    } catch (_) {
-      return _codecTransparente();
-    }
+      for (var i = 0; i < bases.length; i++) {
+        if (vectorial[i]) {
+          final img = await _vectorialDe(i);
+          if (img != null) return ImageInfo(image: img, scale: _pxTesela / 256.0);
+        } else {
+          if (z > zMaxBase[i]) continue;
+          final datos = await _leer(bases[i], z, x, y);
+          if (datos != null) {
+            final buffer = await ui.ImmutableBuffer.fromUint8List(datos);
+            final codec = await decode(buffer); // el await permite atrapar datos corruptos
+            final frame = await codec.getNextFrame();
+            codec.dispose();
+            return ImageInfo(image: frame.image);
+          }
+        }
+      }
+    } catch (_) {}
+    return ImageInfo(image: await _transparente());
   }
 
   @override
@@ -1576,7 +2335,7 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
 
   @override
   ImageStreamCompleter loadImage(_ImagenMbTile key, ImageDecoderCallback decode) =>
-      MultiFrameImageStreamCompleter(codec: _decodificar(decode), scale: 1.0);
+      OneFrameImageStreamCompleter(_cargar(decode));
 
   @override
   bool operator ==(Object other) =>
@@ -1588,11 +2347,15 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
 
 class ProveedorMbTiles extends TileProvider {
   final List<Database> bases;
-  ProveedorMbTiles(this.bases);
+  final List<bool> vectorial;
+  final List<int> zMaxBase;
+  ProveedorMbTiles(this.bases, [List<bool>? vectorial, List<int>? zMaxBase])
+      : vectorial = vectorial ?? List<bool>.filled(bases.length, false),
+        zMaxBase = zMaxBase ?? List<int>.filled(bases.length, 19);
 
   @override
   ImageProvider getImage(TileCoordinates coordinates, TileLayer options) =>
-      _ImagenMbTile(bases, coordinates.x, coordinates.y, coordinates.z);
+      _ImagenMbTile(bases, vectorial, zMaxBase, coordinates.x, coordinates.y, coordinates.z);
 }
 
 // ============================================================================
@@ -1602,7 +2365,7 @@ class ProveedorMbTiles extends TileProvider {
 //  Fuentes PÚBLICAS (la app solo necesita internet mientras descarga):
 //   · Red vial ....... Overpass API (datos de OpenStreetMap, licencia ODbL).
 //   · Municipios ..... Nominatim (buscador de OpenStreetMap).
-//   · Mapas raster ... el servidor de teselas XYZ que el usuario indique (ver panel de Ajustes).
+//   · Mapas vectoriales ... el servidor de teselas XYZ que el usuario indique (ver panel de Ajustes).
 //  Todo se guarda en el almacenamiento de la app y después funciona SIN internet.
 
 const String _agenteHttp = 'NavegacionOfflineMX/1.0 (app de campo; descarga bajo demanda)';
@@ -1985,6 +2748,17 @@ class Teselas {
   }
 }
 
+/// ¿Son teselas vectoriales (protobuf, con o sin gzip) y no una imagen ni una página de error?
+bool _esTeselaVectorial(Uint8List b) {
+  if (_formatoImagen(b) != null) return false;
+  try {
+    _decodificarMvt(_descomprimirTesela(b));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 String? _formatoImagen(Uint8List b) {
   if (b.length < 12) return null;
   if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return 'png';
@@ -2028,7 +2802,7 @@ class _CursorTeselas {
   }
 }
 
-/// Descarga teselas raster de un servidor XYZ y las empaqueta en un archivo .mbtiles
+/// Descarga teselas VECTORIALES (pbf) de un servidor XYZ y las empaqueta en un archivo .mbtiles
 /// (esquema TMS, igual que lee ProveedorMbTiles).
 class DescargadorMapa {
   static const int _tamLote = 150;
@@ -2101,12 +2875,11 @@ class DescargadorMapa {
             }
           }
           if (datos != null && datos.isNotEmpty) {
-            final f = _formatoImagen(datos);
-            if (f == null) {
-              fatal = const ErrorDescarga('El servidor no devolvió imágenes PNG/JPG/WEBP. '
-                  'Revisa la URL: debe ser de teselas raster, no vectoriales.');
+            if (!_esTeselaVectorial(datos)) {
+              fatal = const ErrorDescarga('El servidor no devolvió teselas vectoriales (pbf/mvt). '
+                  'Revisa la URL: debe ser de teselas vectoriales, no imágenes PNG/JPG.');
             } else {
-              formato ??= f;
+              formato ??= 'pbf';
               lote.add({
                 'zoom_level': t.z,
                 'tile_column': t.x,
@@ -2139,7 +2912,7 @@ class DescargadorMapa {
       }
       final meta = <String, String>{
         'name': zona.nombre,
-        'format': formato ?? 'png',
+        'format': formato ?? 'pbf',
         'bounds': '${zona.oeste},${zona.sur},${zona.este},${zona.norte}',
         'minzoom': '$zMin',
         'maxzoom': '$zMax',
@@ -2200,6 +2973,15 @@ class Controlador extends ChangeNotifier {
   int? etaS;
   Maniobra? proxima;
   double distProxima = 0;
+  // Rutas alternativas, paradas intermedias, preferencias y datos de la vía actual
+  List<Ruta> opcionesRuta = <Ruta>[];
+  int idxRuta = 0;
+  final List<LatLng> paradas = <LatLng>[];
+  final List<String> paradasNombres = <String>[];
+  int limiteActual = 0; // km/h de la vía actual (0 = desconocido)
+  String calleActual = '';
+  bool evitarPeajes = false, evitarTerraceria = false;
+  int _ultimoAvisoVelMs = 0;
   bool vozActiva = true;
   bool escuchando = false;
   bool redCargada = false;
@@ -2207,6 +2989,7 @@ class Controlador extends ChangeNotifier {
   List<MapaLocal> mapas = [];
   // Rango de zoom real de los .mbtiles cargados y área que cubren (metadata "bounds")
   int zoomMinTiles = 0, zoomMaxTiles = 19;
+  bool hayVectorial = false; // hay mapas vectoriales: se re-dibujan ampliados hasta el zoom 19
   LatLngBounds? limitesMapa;
   // Brújula: ValueNotifier aparte para redibujar SOLO el widget de la brújula (no toda la pantalla)
   final ValueNotifier<double?> brujula = ValueNotifier<double?>(null);
@@ -2266,6 +3049,7 @@ class Controlador extends ChangeNotifier {
     if (mapas.isEmpty && !await _tienePermisoDescargas()) {
       await _pedirPermisoDescargas();
       await _abrirMapas();
+      await _cargarRedGuardada();
     }
   }
 
@@ -2296,6 +3080,7 @@ class Controlador extends ChangeNotifier {
         await Permission.manageExternalStorage.isPermanentlyDenied;
     await iniciarGps(reiniciar: true);
     await _abrirMapas();
+    await _cargarRedGuardada();
     final ok = await revisarPermisos();
     if (ok) {
       _msg('Todos los permisos concedidos.');
@@ -2410,6 +3195,10 @@ class Controlador extends ChangeNotifier {
     if (fase == Fase.navegando) await _finalizar(false);
     destino = ll;
     destinoNombre = nombre;
+    paradas.clear();
+    paradasNombres.clear();
+    opcionesRuta = <Ruta>[];
+    idxRuta = 0;
     ruta = null;
     fase = Fase.inactiva;
     calculando = false;
@@ -2423,6 +3212,10 @@ class Controlador extends ChangeNotifier {
   Future<void> limpiarDestino() async {
     if (fase == Fase.navegando) await _finalizar(false);
     destino = null;
+    paradas.clear();
+    paradasNombres.clear();
+    opcionesRuta = <Ruta>[];
+    idxRuta = 0;
     ruta = null;
     fase = Fase.inactiva;
     calculando = false;
@@ -2442,22 +3235,20 @@ class Controlador extends ChangeNotifier {
     calculando = true;
     notifyListeners();
     try {
-      final r = await motor.calcular(LatLng(u.latitude, u.longitude), d, modo);
-      _idxSeg = 0;
-      _desvios = 0;
-      _anunciadas.clear();
-      ruta = r;
-      calculando = false;
-      restanteM = r.total;
-      etaS = r.duracionS.round();
-      proxima = r.maniobras.where((m) => m.tipo != TipoGiro.salida).firstOrNull;
-      distProxima = proxima?.acumM ?? r.total;
+      final o = LatLng(u.latitude, u.longitude);
+      final r = await motor.calcular(o, d, modo,
+          paradas: List<LatLng>.of(paradas), nombresParadas: List<String>.of(paradasNombres));
+      opcionesRuta = <Ruta>[r];
+      idxRuta = 0;
+      _aplicarRuta(r);
       notifyListeners();
       if (r.aproximada) _msg('Ruta en línea recta (sin red vial cargada o sin camino).');
       if (iniciar) {
         await _comenzar(r);
       } else if (recalculo) {
         voz.hablar('Ruta recalculada', urgente: true);
+      } else if (paradas.isEmpty && !r.aproximada) {
+        _buscarAlternativas(o, d, r); // sin await: aparecen cuando estén listas
       }
     } catch (e) {
       calculando = false;
@@ -2465,15 +3256,106 @@ class Controlador extends ChangeNotifier {
     }
   }
 
+  // ---------------------------------------------------- rutas alternativas, paradas y preferencias
+  void _aplicarRuta(Ruta r) {
+    _idxSeg = 0;
+    _desvios = 0;
+    _anunciadas.clear();
+    ruta = r;
+    calculando = false;
+    restanteM = r.total;
+    etaS = r.duracionS.round();
+    proxima = r.maniobras.where((m) => m.tipo != TipoGiro.salida).firstOrNull;
+    distProxima = proxima?.acumM ?? r.total;
+    limiteActual = 0;
+    calleActual = '';
+  }
+
+  Future<void> _buscarAlternativas(LatLng o, LatLng d, Ruta mejor) async {
+    try {
+      final alt = await motor.alternativas(o, d, mejor.modo, mejor);
+      if (alt.isEmpty || !identical(ruta, mejor)) return; // cambió el destino mientras se calculaba
+      opcionesRuta = <Ruta>[mejor, ...alt];
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Rota entre la ruta principal y sus alternativas (antes de iniciar la navegación).
+  void alternarRuta() {
+    if (opcionesRuta.length < 2 || fase == Fase.navegando) return;
+    idxRuta = (idxRuta + 1) % opcionesRuta.length;
+    _aplicarRuta(opcionesRuta[idxRuta]);
+    notifyListeners();
+  }
+
+  /// Agrega una parada intermedia antes del destino final (sin destino todavía, será el destino).
+  Future<void> agregarParada(LatLng ll, String nombre) async {
+    if (destino == null) {
+      await establecerDestino(ll, nombre);
+      return;
+    }
+    if (fase == Fase.navegando) return _msg('Detén la navegación para cambiar las paradas.');
+    paradas.add(ll);
+    paradasNombres.add(nombre);
+    notifyListeners();
+    await _calcularRuta();
+  }
+
+  Future<void> quitarParada(int i) async {
+    if (fase == Fase.navegando) return _msg('Detén la navegación para cambiar las paradas.');
+    if (i < 0 || i >= paradas.length) return;
+    paradas.removeAt(i);
+    paradasNombres.removeAt(i);
+    notifyListeners();
+    await _calcularRuta();
+  }
+
+  void _avisarVelocidad() {
+    if (limiteActual <= 0 || modo == Modo.pie || modo == Modo.bici) return;
+    if (velKmh <= limiteActual + 10) return;
+    final ahora = DateTime.now().millisecondsSinceEpoch;
+    if (ahora - _ultimoAvisoVelMs < 45000) return;
+    _ultimoAvisoVelMs = ahora;
+    voz.hablar('Reduce la velocidad. El límite es $limiteActual kilómetros por hora.');
+  }
+
+  Future<void> establecerEvitarPeajes(bool v) async {
+    evitarPeajes = v;
+    motor.evitarPeajes = v;
+    await _guardarAjustes();
+    notifyListeners();
+    if (destino != null) await _calcularRuta(recalculo: fase == Fase.navegando);
+  }
+
+  Future<void> establecerEvitarTerraceria(bool v) async {
+    evitarTerraceria = v;
+    motor.evitarTerraceria = v;
+    await _guardarAjustes();
+    notifyListeners();
+    if (destino != null) await _calcularRuta(recalculo: fase == Fase.navegando);
+  }
+
   // ---------------------------------------------------- navegación activa
   Future<void> iniciarNavegacion() async {
     if (destino == null) return _msg('Elige un destino primero.');
-    if (ubic == null) return _msg('Esperando señal GPS…');
+    final u = ubic;
+    if (u == null) return _msg('Esperando señal GPS…');
+    final r = ruta;
+    // Si elegiste una ruta alternativa y sigues cerca de su inicio, se respeta (no se recalcula)
+    if (r != null &&
+        idxRuta > 0 &&
+        !r.aproximada &&
+        Geo.dist(u.latitude, u.longitude, r.puntos.first.latitude, r.puntos.first.longitude) < 150) {
+      await _comenzar(r);
+      return;
+    }
     await _calcularRuta(iniciar: true); // recalcula desde la posición actual
   }
 
   Future<void> _comenzar(Ruta r) async {
     _recorridoM = 0;
+    opcionesRuta = <Ruta>[r];
+    idxRuta = 0;
     fase = Fase.navegando;
     WakelockPlus.enable(); // pantalla encendida mientras se navega
     if (await Permission.notification.isDenied) await Permission.notification.request();
@@ -2520,6 +3402,9 @@ class Controlador extends ChangeNotifier {
     } else {
       final pr = Geo.proyectar(pos, r.puntos, r.acum, _idxSeg);
       _idxSeg = pr.seg;
+      limiteActual = pr.seg < r.limiteSeg.length ? r.limiteSeg[pr.seg] : 0;
+      calleActual = pr.seg < r.calleSeg.length ? r.calleSeg[pr.seg] : '';
+      _avisarVelocidad();
       final umbral = math.max(modo.umbralDesvio, u.accuracy * 1.5);
       if (pr.dist > umbral) {
         _desvios++;
@@ -2861,7 +3746,9 @@ class Controlador extends ChangeNotifier {
 
     final validos = <MapaLocal>[];
     final invalidos = <String>[];
-    final vectoriales = <String>[];
+    final raster = <String>[];
+    final flagsVec = <bool>[];
+    final zMaxBases = <int>[];
     final vistos = <String>{};
     var zMin = 99, zMax = -1;
     LatLngBounds? unionBounds;
@@ -2872,9 +3759,16 @@ class Controlador extends ChangeNotifier {
         db = await openDatabase(m.ruta, readOnly: true, singleInstance: false);
         await db.rawQuery('SELECT 1 FROM tiles LIMIT 1'); // comprueba que sea un MBTiles real
         final fmt = await _formatoMb(db);
-        if (fmt == 'pbf' || fmt == 'mvt') {
-          await db.close(); // teselas vectoriales: flutter_map raster no las puede dibujar
-          vectoriales.add(m.nombre);
+        var esVec = fmt == 'pbf' || fmt == 'mvt';
+        if (!esVec && fmt.isEmpty) {
+          // Sin metadata "format": se mira una tesela de muestra (si no es imagen, se asume vectorial)
+          final mu = await db.rawQuery('SELECT tile_data FROM tiles LIMIT 1');
+          final d0 = mu.isEmpty ? null : mu.first['tile_data'];
+          if (d0 is Uint8List) esVec = _esTeselaVectorial(d0);
+        }
+        if (!esVec) {
+          await db.close(); // esta app solo usa mapas VECTORIALES: los raster (png/jpg/webp) se ignoran
+          raster.add(m.nombre);
           continue;
         }
         final zr = await db.rawQuery('SELECT MIN(zoom_level) AS a, MAX(zoom_level) AS b FROM tiles');
@@ -2890,6 +3784,8 @@ class Controlador extends ChangeNotifier {
             unionBounds.extend(lim.southWest);
           }
         }
+        flagsVec.add(esVec);
+        zMaxBases.add(b is int ? b : 19);
         _basesMb.add(db);
         validos.add(m);
       } catch (_) {
@@ -2901,11 +3797,12 @@ class Controlador extends ChangeNotifier {
     zoomMinTiles = zMax >= 0 ? zMin : 0;
     zoomMaxTiles = zMax >= 0 ? zMax : 19;
     limitesMapa = unionBounds;
-    proveedorTiles = ProveedorMbTiles(List<Database>.of(_basesMb));
+    hayVectorial = flagsVec.contains(true);
+    proveedorTiles = ProveedorMbTiles(List<Database>.of(_basesMb), flagsVec, zMaxBases);
     versionMapas++;
     notifyListeners();
-    if (vectoriales.isNotEmpty) {
-      _msg('${vectoriales.join(', ')} es VECTORIAL (pbf). Esta app necesita un .mbtiles raster (png/jpg).');
+    if (raster.isNotEmpty && validos.isEmpty) {
+      _msg('${raster.join(', ')} es un mapa RASTER y se ignora: esta app solo usa mapas vectoriales (.mbtiles con teselas pbf).');
     } else if (invalidos.isNotEmpty) {
       _msg('No se pudo abrir como MBTiles: ${invalidos.join(', ')}');
     }
@@ -2930,14 +3827,14 @@ class Controlador extends ChangeNotifier {
     final origen = sel?.files.single.path;
     if (origen == null) return;
     if (!origen.toLowerCase().endsWith('.mbtiles')) {
-      return _msg('Formato no soportado: usa un archivo .mbtiles de teselas raster (PNG/JPG).');
+      return _msg('Formato no soportado: usa un archivo .mbtiles VECTORIAL (teselas pbf).');
     }
     _msg('Importando mapa… los archivos grandes pueden tardar.');
     try {
       final carpeta = await _carpeta('mapas');
       await File(origen).copy(ruta_p.join(carpeta.path, ruta_p.basename(origen).replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_')));
       await _abrirMapas();
-      if (mapas.isNotEmpty) _msg('Mapa importado.');
+      if (mapas.isNotEmpty) _msg('Mapa vectorial importado.');
     } catch (e) {
       _msg('No se pudo importar el mapa: $e');
     }
@@ -2964,7 +3861,12 @@ class Controlador extends ChangeNotifier {
     notifyListeners();
     try {
       final carpeta = await _carpeta('red');
-      await File(origen).copy(ruta_p.join(carpeta.path, 'red_vial.geojson'));
+      if (!_esGeoJson(origen)) {
+        redEstado = 'Sin red vial: se usa ruta en línea recta';
+        return _msg('Formato no soportado: usa un archivo .geojson.');
+      }
+      final nombre = ruta_p.basename(origen).replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+      await File(origen).copy(ruta_p.join(carpeta.path, nombre));
       await _cargarRedGuardada();
     } catch (e) {
       redEstado = 'Error al importar la red vial';
@@ -2973,11 +3875,52 @@ class Controlador extends ChangeNotifier {
   }
 
   // ---- Regiones de red vial guardadas (varios .geojson en la carpeta «red») ----
+  static bool _esGeoJson(String ruta) {
+    final m = ruta.toLowerCase();
+    return m.endsWith('.geojson') || m.endsWith('.json');
+  }
+
+  /// Archivos de red vial de la app (carpeta «red») y, si hay permiso, los .geojson de Descargas
+  /// (se leen EN SITIO, igual que los mapas). Si un nombre está en los dos sitios se usa el de la app.
   Future<List<File>> _archivosRed() async {
     final dir = await _carpeta('red');
-    final r = dir.listSync().whereType<File>().where((f) => f.path.toLowerCase().endsWith('.geojson')).toList();
+    final r = dir.listSync().whereType<File>().where((f) => _esGeoJson(f.path)).toList();
+    final vistos = r.map((f) => ruta_p.basename(f.path).toLowerCase()).toSet();
+    redEnDescargas.clear();
+    if (await _tienePermisoDescargas()) {
+      for (final ruta in await _carpetasDescargas()) {
+        try {
+          final d = Directory(ruta);
+          if (!await d.exists()) continue;
+          await for (final e in d.list(followLinks: false)) {
+            // en Descargas solo .geojson (un .json suelto puede ser cualquier otra cosa)
+            if (e is File && e.path.toLowerCase().endsWith('.geojson') && vistos.add(ruta_p.basename(e.path).toLowerCase())) {
+              r.add(e);
+              redEnDescargas.add(e.path);
+            }
+          }
+          break;
+        } on FileSystemException {
+          continue;
+        }
+      }
+    }
     r.sort((a, b) => a.path.compareTo(b.path));
     return r;
+  }
+
+  final Set<String> redEnDescargas = <String>{};
+
+  /// Botón «Buscar en Descargas» de la red vial.
+  Future<void> buscarRedEnDescargas() async {
+    if (!await _pedirPermisoDescargas()) {
+      _msg('Sin el permiso «Acceso a todos los archivos» no puedo leer la carpeta Descargas.');
+      return;
+    }
+    await _cargarRedGuardada();
+    _msg(redEnDescargas.isEmpty
+        ? 'No encontré archivos .geojson en la carpeta Descargas.'
+        : 'Red vial leída desde Descargas (${redEnDescargas.length} ${redEnDescargas.length == 1 ? 'archivo' : 'archivos'}).');
   }
 
   /// Carga TODAS las regiones guardadas en un solo grafo (se unen por coordenadas).
@@ -3007,6 +3950,9 @@ class Controlador extends ChangeNotifier {
   }
 
   Future<void> eliminarRegionRed(File f) async {
+    if (redEnDescargas.contains(f.path)) {
+      return _msg('Ese archivo está en Descargas: bórralo desde tu administrador de archivos.');
+    }
     try {
       if (await f.exists()) await f.delete();
     } catch (e) {
@@ -3017,6 +3963,7 @@ class Controlador extends ChangeNotifier {
 
   Future<void> quitarRedVial() async {
     for (final f in await _archivosRed()) {
+      if (redEnDescargas.contains(f.path)) continue; // los de Descargas no se tocan
       try {
         await f.delete();
       } catch (_) {}
@@ -3043,16 +3990,30 @@ class Controlador extends ChangeNotifier {
       final f = await _archivoAjustesDescarga();
       if (await f.exists()) {
         final m = jsonDecode(await f.readAsString());
-        if (m is Map) plantillaTeselas = '${m['plantilla'] ?? ''}';
+        if (m is Map) {
+          plantillaTeselas = '${m['plantilla'] ?? ''}';
+          evitarPeajes = m['evitarPeajes'] == true;
+          evitarTerraceria = m['evitarTerraceria'] == true;
+          motor.evitarPeajes = evitarPeajes;
+          motor.evitarTerraceria = evitarTerraceria;
+        }
       }
+    } catch (_) {}
+  }
+
+  Future<void> _guardarAjustes() async {
+    try {
+      await (await _archivoAjustesDescarga()).writeAsString(jsonEncode({
+        'plantilla': plantillaTeselas,
+        'evitarPeajes': evitarPeajes,
+        'evitarTerraceria': evitarTerraceria,
+      }));
     } catch (_) {}
   }
 
   Future<void> _guardarPlantilla(String p) async {
     plantillaTeselas = p;
-    try {
-      await (await _archivoAjustesDescarga()).writeAsString(jsonEncode({'plantilla': p}));
-    } catch (_) {}
+    await _guardarAjustes();
   }
 
   void _iniciarDescarga(bool esMapa, String texto) {
@@ -3172,7 +4133,7 @@ class Controlador extends ChangeNotifier {
     } catch (_) {}
   }
 
-  /// Descarga teselas raster del país, un estado o un municipio y las guarda como .mbtiles.
+  /// Descarga teselas vectoriales del país, un estado o un municipio y las guarda como .mbtiles.
   Future<void> descargarMapa({
     required Alcance alcance,
     EstadoMx? estado,
@@ -3187,7 +4148,7 @@ class Controlador extends ChangeNotifier {
     if (alcance == Alcance.municipio && municipio == null) return _msg('Busca y elige un municipio.');
     final url = plantilla.trim();
     if (!url.contains('{z}') || !url.contains('{x}') || !url.contains('{y}')) {
-      return _msg('La URL del servidor debe incluir {z}, {x} y {y}. Ej.: https://servidor/{z}/{x}/{y}.png');
+      return _msg('La URL del servidor debe incluir {z}, {x} y {y}. Ej.: https://servidor/{z}/{x}/{y}.pbf');
     }
     final uri = Uri.tryParse(url.replaceAll('{z}', '0').replaceAll('{x}', '0').replaceAll('{y}', '0'));
     if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) {
@@ -3495,7 +4456,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
           tileProvider: c.proveedorTiles,
           // Rango real de zoom del .mbtiles: más allá, flutter_map amplía las teselas en vez de dejar blanco
           minNativeZoom: c.zoomMinTiles,
-          maxNativeZoom: c.zoomMaxTiles,
+          maxNativeZoom: c.hayVectorial ? 19 : c.zoomMaxTiles,
           maxZoom: 19,
           errorTileCallback: (tile, error, stack) {},
         ),
@@ -3862,8 +4823,8 @@ class PantallaMenu extends StatelessWidget {
       const SizedBox(height: 8),
       OutlinedButton(onPressed: openAppSettings, child: const Text('Abrir ajustes de la app')),
       const Divider(),
-      const Text('Mapas offline (.mbtiles raster)', style: TextStyle(fontWeight: FontWeight.bold)),
-      if (c.mapas.isEmpty) const Text('No hay mapas. Copia el .mbtiles a la carpeta Descargas y pulsa «Buscar en Descargas».'),
+      const Text('Mapas vectoriales offline (.mbtiles pbf)', style: TextStyle(fontWeight: FontWeight.bold)),
+      if (c.mapas.isEmpty) const Text('No hay mapas vectoriales. Copia el .mbtiles (pbf) a la carpeta Descargas y pulsa «Buscar en Descargas».'),
       for (final m in c.mapas)
         ListTile(
           contentPadding: EdgeInsets.zero,
@@ -3886,11 +4847,16 @@ class PantallaMenu extends StatelessWidget {
           dense: true,
           leading: const Icon(Icons.alt_route),
           title: Text(ruta_p.basename(f.path), maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text(_tamanoArchivo(f)),
-          trailing: IconButton(onPressed: () => c.eliminarRegionRed(f), icon: const Icon(Icons.delete_outline)),
+          subtitle: Text('${c.redEnDescargas.contains(f.path) ? 'Leído desde Descargas' : 'Guardado en la app'} · ${_tamanoArchivo(f)}'),
+          trailing: c.redEnDescargas.contains(f.path)
+              ? null
+              : IconButton(onPressed: () => c.eliminarRegionRed(f), icon: const Icon(Icons.delete_outline)),
         ),
+      if (c.regionesRed.isEmpty) const Text('Copia tu .geojson a la carpeta Descargas y pulsa «Buscar en Descargas».'),
       const SizedBox(height: 8),
-      FilledButton(onPressed: c.importarRedVial, child: const Text('Importar red vial (GeoJSON)')),
+      FilledButton(onPressed: c.buscarRedEnDescargas, child: const Text('Buscar en Descargas')),
+      const SizedBox(height: 8),
+      OutlinedButton(onPressed: c.importarRedVial, child: const Text('Elegir y copiar un .geojson…')),
       if (c.redCargada)
         Padding(
           padding: const EdgeInsets.only(top: 8),
@@ -4088,8 +5054,8 @@ class _EstadoPanelDescarga extends State<PanelDescarga> {
               enabled: !ocupado,
               keyboardType: TextInputType.url,
               decoration: const InputDecoration(
-                labelText: 'Servidor de teselas raster (XYZ)',
-                hintText: 'https://tu-servidor/{z}/{x}/{y}.png',
+                labelText: 'Servidor de teselas vectoriales (XYZ, pbf)',
+                hintText: 'https://tu-servidor/{z}/{x}/{y}.pbf',
                 helperMaxLines: 6,
                 helperText: 'La app no trae un servidor fijo: usa uno propio o de un proveedor cuya licencia permita '
                     'descargar para uso sin conexión. El servidor público de OpenStreetMap '
