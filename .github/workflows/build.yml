@@ -187,6 +187,30 @@ jobs:
                   print(f'Agregado namespace en: {bg_path}')
           "
 
+      - name: 5. Parchear Uint8List en lib/main.dart con Python
+        run: |
+          python3 -c "
+          import os
+
+          main_path = 'lib/main.dart'
+          if os.path.exists(main_path):
+              with open(main_path, 'r', encoding='utf-8') as f:
+                  code = f.read()
+
+              code = code.replace(
+                  'Uint8List.sublistView(trozo, ini, i + 1)',
+                  'Uint8List.fromList(trozo.sublist(ini, i + 1))'
+              )
+              code = code.replace(
+                  'Uint8List.sublistView(trozo, ini, trozo.length)',
+                  'Uint8List.fromList(trozo.sublist(ini, trozo.length))'
+              )
+
+              with open(main_path, 'w', encoding='utf-8') as f:
+                  f.write(code)
+              print('Parche aplicadas correcciones de Uint8List en lib/main.dart')
+          "
+
       - run: flutter pub get
       - run: flutter build apk --debug
       - uses: actions/upload-artifact@v4
