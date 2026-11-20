@@ -721,6 +721,103 @@ class _ListaF64 {
   Float64List recortar() => _d.sublist(0, length);
 }
 
+/// Tabla hash abierta (clave 64 bits → nodo) con arreglos tipados: usa ~3 veces menos memoria que un Map
+/// y permite redes viales de un estado completo en equipos de 4 GB.
+class _TablaNodos {
+  Int64List _k = Int64List(1 << 16)..fillRange(0, 1 << 16, -1);
+  Int32List _v = Int32List(1 << 16);
+  int _n = 0;
+
+  static int _pos(int clave, int mascara) => ((clave * 0x5851F42D4C957F2D) >>> 29) & mascara;
+
+  int buscar(int clave) {
+    final m = _k.length - 1;
+    var i = _pos(clave, m);
+    while (true) {
+      final c = _k[i];
+      if (c == clave) return _v[i];
+      if (c == -1) return -1;
+      i = (i + 1) & m;
+    }
+  }
+
+  void poner(int clave, int valor) {
+    if ((_n + 1) * 10 > _k.length * 7) _crecer();
+    final m = _k.length - 1;
+    var i = _pos(clave, m);
+    while (_k[i] != -1) {
+      i = (i + 1) & m;
+    }
+    _k[i] = clave;
+    _v[i] = valor;
+    _n++;
+  }
+
+  void _crecer() {
+    final kv = _k, vv = _v;
+    final nuevo = kv.length * 2;
+    _k = Int64List(nuevo)..fillRange(0, nuevo, -1);
+    _v = Int32List(nuevo);
+    final m = nuevo - 1;
+    for (var j = 0; j < kv.length; j++) {
+      final c = kv[j];
+      if (c == -1) continue;
+      var i = _pos(c, m);
+      while (_k[i] != -1) {
+        i = (i + 1) & m;
+      }
+      _k[i] = c;
+      _v[i] = vv[j];
+    }
+  }
+}
+
+/// Lee un GeoJSON de CUALQUIER tamaño en flujo (sin cargarlo completo) y entrega el texto de cada Feature.
+/// Funciona aunque todo el archivo esté en una sola línea. Respeta cadenas y escapes.
+Stream<String> _featuresGeoJson(File f) async* {
+  final pila = <int>[]; // 0x7B = objeto, 0x5B = arreglo
+  final acum = BytesBuilder();
+  var enCadena = false, escape = false, capturando = false;
+  var profCaptura = 0;
+  await for (final trozo in f.openRead()) {
+    var ini = 0; // si se está capturando un objeto, inicia en este trozo
+    for (var i = 0; i < trozo.length; i++) {
+      final b = trozo[i];
+      if (enCadena) {
+        if (escape) {
+          escape = false;
+        } else if (b == 0x5C) {
+          escape = true;
+        } else if (b == 0x22) {
+          enCadena = false;
+        }
+        continue;
+      }
+      if (b == 0x22) {
+        enCadena = true;
+      } else if (b == 0x7B) {
+        // los objetos Feature son los que están directamente dentro de un arreglo (raíz o "features")
+        if (!capturando && pila.isNotEmpty && pila.last == 0x5B && pila.length <= 2) {
+          capturando = true;
+          profCaptura = pila.length;
+          ini = i;
+        }
+        pila.add(0x7B);
+      } else if (b == 0x5B) {
+        pila.add(0x5B);
+      } else if (b == 0x7D || b == 0x5D) {
+        if (pila.isNotEmpty) pila.removeLast();
+        if (capturando && b == 0x7D && pila.length == profCaptura) {
+          acum.add(Uint8List.sublistView(trozo, ini, i + 1));
+          capturando = false;
+          yield utf8.decode(acum.takeBytes(), allowMalformed: true);
+        }
+      }
+    }
+    if (capturando) acum.add(Uint8List.sublistView(trozo, ini, trozo.length));
+  }
+}
+
 /// ¿El archivo lo generó esta app (una vía por línea)? Entonces se puede leer en flujo.
 Future<bool> _esGeoJsonPorLineas(File f) async {
   final raf = await f.open();
@@ -745,8 +842,107 @@ int _parseMaxspeed(String? t) {
 /// Construye el grafo desde uno o varios GeoJSON de OSM. Se ejecuta en un isolate (no congela la UI).
 /// Los archivos descargados por la app se leen línea por línea (poca memoria); cualquier otro
 /// GeoJSON (p. ej. importado a mano) se carga completo, como antes.
-Future<RedVial> construirRed(List<String> rutas) async {
-  final claveANodo = <int, int>{};
+/// Zona geográfica (sur, oeste, norte, este): permite cargar solo una parte de una red vial enorme.
+typedef Ventana = ({double s, double w, double n, double e});
+
+/// ¿Algún punto de la vía (texto GeoJSON de un Feature) cae dentro de [v]? Revisa solo los números
+/// de "coordinates", sin construir objetos: así se descartan rápido millones de vías lejanas.
+bool _tocaVentana(String t, Ventana v) {
+  var i = t.indexOf('"coordinates"');
+  if (i < 0) return true;
+  i += 13;
+  final n = t.length;
+  var k = 0;
+  var lon = 0.0, lat = 0.0;
+  while (i < n) {
+    final c = t.codeUnitAt(i);
+    if (c == 0x7D) break; // '}' = termina la geometría
+    if (c == 0x5B) {
+      k = 0;
+      i++;
+    } else if (c == 0x5D) {
+      if (k >= 2 && lat >= v.s && lat <= v.n && lon >= v.w && lon <= v.e) return true;
+      k = 0;
+      i++;
+    } else if (c == 0x2D || (c >= 0x30 && c <= 0x39)) {
+      var j = i + 1;
+      while (j < n) {
+        final d = t.codeUnitAt(j);
+        if (d == 0x2C || d == 0x5D || d == 0x20) break;
+        j++;
+      }
+      final x = double.tryParse(t.substring(i, j));
+      if (x != null) {
+        if (k == 0) lon = x;
+        if (k == 1) lat = x;
+        k++;
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return false;
+}
+
+/// Recorre un GeoJSON de CUALQUIER tamaño y escribe un índice de nombres de calles: una línea
+/// «nombre normalizado ⇥ nombre ⇥ lat ⇥ lon» por calle y por zona de ~11 km. [args] = [geojson, salida].
+/// Corre en un isolate y casi no usa memoria (lectura en flujo, sin decodificar cada vía).
+Future<int> construirIndiceCalles(List<String> args) async {
+  final entrada = File(args[0]);
+  final tmp = File('${args[1]}.tmp');
+  final sink = tmp.openWrite();
+  final vistos = <int>{};
+  var total = 0;
+  final reNombre = RegExp(r'"name"\s*:\s*"((?:[^"\\]|\\.)*)"');
+  const numRe = r'(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)';
+  final reCoord = RegExp('"coordinates"\\s*:\\s*\\[(?:\\s*\\[)+\\s*$numRe\\s*,\\s*$numRe');
+
+  void tratar(String t) {
+    if (!t.contains('"highway"')) return;
+    final mn = reNombre.firstMatch(t);
+    if (mn == null) return;
+    final mc = reCoord.firstMatch(t);
+    if (mc == null) return;
+    var nombre = mn.group(1)!;
+    if (nombre.contains('\\')) {
+      try {
+        nombre = jsonDecode('"$nombre"') as String;
+      } catch (_) {}
+    }
+    nombre = nombre.replaceAll(RegExp(r'[\t\r\n]'), ' ').trim();
+    if (nombre.isEmpty) return;
+    final lon = double.tryParse(mc.group(1)!), lat = double.tryParse(mc.group(2)!);
+    if (lat == null || lon == null) return;
+    final norm = Fmt.normalizar(nombre);
+    if (norm.isEmpty) return;
+    final celda = (lat / 0.1).floor() * 100000 + (lon / 0.1).floor();
+    if (!vistos.add(Object.hash(norm, celda))) return;
+    sink.write('$norm\t$nombre\t${lat.toStringAsFixed(5)}\t${lon.toStringAsFixed(5)}\n');
+    total++;
+  }
+
+  try {
+    if (await _esGeoJsonPorLineas(entrada)) {
+      final lineas = entrada.openRead().transform(utf8.decoder).transform(const LineSplitter());
+      await for (final l in lineas) {
+        if (l.startsWith('{"type":"Feature"') || l.startsWith(',{"type":"Feature"')) tratar(l);
+      }
+    } else {
+      await for (final t in _featuresGeoJson(entrada)) {
+        tratar(t);
+      }
+    }
+    await sink.flush();
+  } finally {
+    await sink.close();
+  }
+  await tmp.rename(args[1]);
+  return total;
+}
+
+Future<RedVial> construirRed(List<String> rutas, [Ventana? ventana]) async {
+  final claveANodo = _TablaNodos();
   final lats = _ListaF64(), lons = _ListaF64();
   final ef = _ListaI32(), et = _ListaI32(), en = _ListaI32();
   final ec = _ListaU8(), ek = _ListaU8(), ev = _ListaU8();
@@ -754,15 +950,21 @@ Future<RedVial> construirRed(List<String> rutas) async {
   final idsNombre = <String, int>{};
   final nombres = <String>[];
   final reps = <int, List<int>>{};
+  // Con más de 400 MB de GeoJSON se omiten senderos, ciclovías y vías de servicio para que quepa en memoria
+  var bytesTotal = 0;
+  for (final r in rutas) {
+    bytesTotal += await File(r).length();
+  }
+  final ligera = bytesTotal > 400 * 1024 * 1024;
 
   int nodo(double lat, double lon) {
     final k = ((lat * 1e6).round() + 90000000) * 400000000 + ((lon * 1e6).round() + 180000000);
-    final e = claveANodo[k];
-    if (e != null) return e;
+    final e = claveANodo.buscar(k);
+    if (e >= 0) return e;
     final n = lats.length;
     lats.add(lat);
     lons.add(lon);
-    claveANodo[k] = n;
+    claveANodo.poner(k, n);
     return n;
   }
 
@@ -793,6 +995,7 @@ Future<RedVial> construirRed(List<String> rutas) async {
     if (props is! Map || geom is! Map) return;
     final claseVia = claseDesdeOsm(props['highway']?.toString());
     if (claseVia == null) return;
+    if (ligera && (claseVia == ClaseVia.peatonal || claseVia == ClaseVia.ciclovia || claseVia == ClaseVia.servicio)) return;
     final ow = props['oneway']?.toString();
     final junc = props['junction']?.toString();
     // 0 = ambos sentidos, 1 = adelante, 2 = atrás
@@ -840,12 +1043,27 @@ Future<RedVial> construirRed(List<String> rutas) async {
 
   for (final ruta in rutas) {
     final archivo = File(ruta);
+    final tam = await archivo.length();
+    if (tam > 20 * 1024 * 1024 && await _esGeoJsonPorLineas(archivo) == false) {
+      // GeoJSON grande hecho por otra herramienta: se lee en flujo, objeto por objeto
+      await for (final t in _featuresGeoJson(archivo)) {
+        if (!t.contains('"highway"')) continue; // edificios, límites, etc. no sirven para rutas
+        if (ventana != null && !_tocaVentana(t, ventana)) continue; // vía fuera de la zona cargada
+        try {
+          procesar(jsonDecode(t));
+        } on FormatException {
+          continue;
+        }
+      }
+      continue;
+    }
     if (await _esGeoJsonPorLineas(archivo)) {
       final lineas = archivo.openRead().transform(utf8.decoder).transform(const LineSplitter());
       await for (final linea in lineas) {
         var t = linea.trim();
         if (t.startsWith(',')) t = t.substring(1);
         if (!t.startsWith('{"type":"Feature"')) continue;
+        if (ventana != null && !_tocaVentana(t, ventana)) continue;
         try {
           procesar(jsonDecode(t));
         } on FormatException {
@@ -976,8 +1194,8 @@ class MotorRutas {
   List<int> _ultimasAristas = const <int>[];
   static const double _maxAjusteM = 3000;
 
-  Future<int> cargar(List<String> rutas) async {
-    final nueva = await Isolate.run(() => construirRed(rutas));
+  Future<int> cargar(List<String> rutas, [Ventana? ventana]) async {
+    final nueva = await Isolate.run(() => construirRed(rutas, ventana));
     red = nueva;
     return nueva.nodos;
   }
@@ -1182,12 +1400,160 @@ class Hist {
       (m['completada'] as int) == 1);
 }
 
+/// Tipos de lugar que se pueden descargar de OpenStreetMap para buscar SIN internet.
+enum TipoLugar {
+  gasolinera('Gasolinera', '⛽', 'amenity', 'fuel'),
+  hospital('Hospital / clínica', '🏥', 'amenity', 'hospital|clinic'),
+  farmacia('Farmacia', '💊', 'amenity', 'pharmacy'),
+  tienda('Tienda / súper', '🛒', 'shop', 'convenience|supermarket|general'),
+  comida('Comida / café', '🍽️', 'amenity', 'restaurant|fast_food|cafe'),
+  cajero('Banco / cajero', '🏧', 'amenity', 'atm|bank'),
+  hotel('Hotel / hospedaje', '🏨', 'tourism', 'hotel|motel|hostel|guest_house'),
+  taller('Taller / llantera', '🔧', 'shop', 'car_repair|tyres'),
+  policia('Policía / bomberos', '🚓', 'amenity', 'police|fire_station'),
+  poblado('Poblados y colonias', '🏘️', 'place', 'city|town|village|hamlet|suburb|neighbourhood|quarter');
+
+  const TipoLugar(this.etiqueta, this.icono, this.clave, this.valores);
+  final String etiqueta, icono;
+  final String clave; // etiqueta de OSM (amenity, shop, tourism, place)
+  final String valores; // valores separados por |
+
+  /// Tipo de un elemento de OSM según sus etiquetas (null si no interesa).
+  static TipoLugar? deEtiquetas(Map tags) {
+    for (final t in TipoLugar.values) {
+      final v = tags[t.clave];
+      if (v is String && t.valores.split('|').contains(v)) return t;
+    }
+    return null;
+  }
+}
+
+/// Tipo de lugar mencionado en una frase ("gasolinera", "farmacia", "hospital"...).
+TipoLugar? tipoLugarDeTexto(String t) {
+  bool tiene(List<String> c) => c.any(t.contains);
+  if (tiene(['gasolin', 'gasol', 'combustible', 'diesel'])) return TipoLugar.gasolinera;
+  if (tiene(['hospital', 'clinica', 'urgencias', 'medico', 'doctor'])) return TipoLugar.hospital;
+  if (tiene(['farmacia'])) return TipoLugar.farmacia;
+  if (tiene(['tienda', 'super', 'oxxo', 'abarrotes'])) return TipoLugar.tienda;
+  if (tiene(['restaurante', 'comida', 'comer', 'cafe', 'taqueria', 'fonda'])) return TipoLugar.comida;
+  if (tiene(['cajero', 'banco'])) return TipoLugar.cajero;
+  if (tiene(['hotel', 'motel', 'hospedaje', 'hostal', 'dormir'])) return TipoLugar.hotel;
+  if (tiene(['taller', 'mecanico', 'llantera', 'vulcanizadora', 'ponchadura'])) return TipoLugar.taller;
+  if (tiene(['policia', 'bombero', 'patrulla'])) return TipoLugar.policia;
+  return null;
+}
+
+/// Lugar descargado de OSM (guardado en la tabla lugares_osm).
+class Lugar {
+  final String nombre;
+  final TipoLugar tipo;
+  final double lat, lon;
+  const Lugar(this.nombre, this.tipo, this.lat, this.lon);
+}
+
+/// Resultado de una búsqueda (lugar guardado, lugar de OSM, calle o coordenadas).
+class Resultado {
+  final String titulo, detalle, icono;
+  final double lat, lon;
+  const Resultado(this.titulo, this.detalle, this.icono, this.lat, this.lon);
+}
+
+/// Descarga lugares (gasolineras, hospitales, comercios…) de OSM por bloques y los guarda en SQLite.
+class DescargadorLugares {
+  static const int _maxPorBloque = 6000;
+  final Overpass _op;
+  final Datos _datos;
+  DescargadorLugares(this._op, this._datos);
+
+  String _consulta(_Celda c, Set<TipoLugar> tipos) {
+    final caja = '${c.s.toStringAsFixed(5)},${c.w.toStringAsFixed(5)},${c.n.toStringAsFixed(5)},${c.e.toStringAsFixed(5)}';
+    final porClave = <String, List<String>>{};
+    for (final t in tipos) {
+      porClave.putIfAbsent(t.clave, () => <String>[]).add(t.valores);
+    }
+    final partes = StringBuffer();
+    porClave.forEach((clave, vals) {
+      partes.write('nwr(area.a)["$clave"~"^(${vals.join('|')})\$"]($caja);');
+    });
+    return '[out:json][timeout:180];area(${c.zona.areaId})->.a;($partes);out tags center qt $_maxPorBloque;';
+  }
+
+  /// Devuelve cuántos lugares se guardaron.
+  Future<int> descargar({
+    required List<Zona> zonas,
+    required Set<TipoLugar> tipos,
+    required void Function(double, String) progreso,
+    required bool Function() cancelado,
+  }) async {
+    final cola = DescargadorRed.bloquesIniciales(zonas);
+    var i = 0, total = 0;
+    while (i < cola.length) {
+      if (cancelado()) throw const ErrorDescarga('Descarga cancelada.');
+      final c = cola[i++];
+      final j = await _op.consultar(_consulta(c, tipos), cancelado);
+      final els = j['elements'];
+      final List lista = els is List ? els : <dynamic>[];
+      if (lista.length >= _maxPorBloque && c.lado > 0.01) {
+        final mf = (c.s + c.n) / 2, mw = (c.w + c.e) / 2;
+        cola.add(_Celda(c.zona, c.s, c.w, mf, mw));
+        cola.add(_Celda(c.zona, c.s, mw, mf, c.e));
+        cola.add(_Celda(c.zona, mf, c.w, c.n, mw));
+        cola.add(_Celda(c.zona, mf, mw, c.n, c.e));
+      } else {
+        final filas = <Map<String, Object?>>[];
+        for (final e in lista) {
+          if (e is! Map) continue;
+          final tags = e['tags'];
+          if (tags is! Map) continue;
+          final tipo = TipoLugar.deEtiquetas(tags);
+          if (tipo == null || !tipos.contains(tipo)) continue;
+          double? lat, lon;
+          if (e['type'] == 'node') {
+            final a = e['lat'], b = e['lon'];
+            if (a is num && b is num) {
+              lat = a.toDouble();
+              lon = b.toDouble();
+            }
+          } else {
+            final ce = e['center'];
+            if (ce is Map && ce['lat'] is num && ce['lon'] is num) {
+              lat = (ce['lat'] as num).toDouble();
+              lon = (ce['lon'] as num).toDouble();
+            }
+          }
+          if (lat == null || lon == null) continue;
+          var nombre = '${tags['name'] ?? tags['brand'] ?? tags['operator'] ?? ''}'.trim();
+          if (nombre.isEmpty) {
+            if (tipo == TipoLugar.poblado) continue; // un poblado sin nombre no sirve
+            nombre = tipo.etiqueta;
+          }
+          filas.add(<String, Object?>{
+            'clave': '${'${e['type']}'.substring(0, 1)}${e['id']}',
+            'nombre': nombre,
+            'nombreNorm': Fmt.normalizar(nombre),
+            'tipo': tipo.name,
+            'lat': lat,
+            'lon': lon,
+          });
+        }
+        total += await _datos.insertarLugares(filas);
+      }
+      progreso(i / cola.length, 'Lugares: ${c.zona.nombre} · bloque $i de ${cola.length} · $total lugares');
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    return total;
+  }
+}
+
 class Datos {
   late Database db;
 
   Future<void> abrir() async {
     final ruta = ruta_p.join(await getDatabasesPath(), 'navegacion_offline.db');
-    db = await openDatabase(ruta, version: 1, onCreate: (d, v) async {
+    db = await openDatabase(ruta, version: 2, onUpgrade: (d, viejo, nuevo) async {
+      if (viejo < 2) await _crearLugares(d);
+    }, onCreate: (d, v) async {
+      await _crearLugares(d);
       await d.execute('CREATE TABLE puntos_interes(id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL, '
           'categoria TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, creadoMs INTEGER NOT NULL)');
       await d.execute('CREATE TABLE rutas_frecuentes(id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL, '
@@ -1197,6 +1563,60 @@ class Datos {
           'finMs INTEGER, destinoNombre TEXT NOT NULL, modo TEXT NOT NULL, planM REAL NOT NULL, '
           'recorridoM REAL NOT NULL DEFAULT 0, completada INTEGER NOT NULL DEFAULT 0)');
     });
+  }
+
+  static Future<void> _crearLugares(Database d) async {
+    await d.execute('CREATE TABLE IF NOT EXISTS lugares_osm(id INTEGER PRIMARY KEY AUTOINCREMENT, clave TEXT NOT NULL UNIQUE, '
+        'nombre TEXT NOT NULL, nombreNorm TEXT NOT NULL, tipo TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL)');
+    await d.execute('CREATE INDEX IF NOT EXISTS idx_lugares_tipo ON lugares_osm(tipo, lat)');
+  }
+
+  Future<int> insertarLugares(List<Map<String, Object?>> filas) async {
+    if (filas.isEmpty) return 0;
+    final b = db.batch();
+    for (final f in filas) {
+      b.insert('lugares_osm', f, conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await b.commit(noResult: true);
+    return filas.length;
+  }
+
+  Future<int> totalLugares() async =>
+      Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM lugares_osm')) ?? 0;
+
+  Future<void> borrarLugares() async => db.delete('lugares_osm');
+
+  static Lugar _lugarDe(Map<String, Object?> m) => Lugar(
+      m['nombre'] as String,
+      TipoLugar.values.firstWhere((t) => t.name == m['tipo'], orElse: () => TipoLugar.poblado),
+      (m['lat'] as num).toDouble(),
+      (m['lon'] as num).toDouble());
+
+  /// Lugares cuyo nombre contiene [norm] (ya normalizado); primero los que empiezan con el texto.
+  Future<List<Lugar>> buscarLugares(String norm, {int limite = 40}) async {
+    final t = norm.replaceAll(RegExp(r'[%_\\]'), '');
+    if (t.length < 2) return <Lugar>[];
+    final r = await db.rawQuery(
+        'SELECT nombre, tipo, lat, lon FROM lugares_osm WHERE nombreNorm LIKE ? '
+        'ORDER BY (nombreNorm LIKE ?) DESC, length(nombreNorm) LIMIT ?',
+        ['%$t%', '$t%', limite]);
+    return r.map(_lugarDe).toList();
+  }
+
+  /// Los [limite] lugares de [tipo] más cercanos a (lat, lon), ampliando el radio de búsqueda poco a poco.
+  Future<List<({Lugar lugar, double m})>> lugaresCercanos(TipoLugar tipo, double lat, double lon,
+      {int limite = 8}) async {
+    for (final radio in const <double>[0.05, 0.2, 0.7, 2.5]) {
+      final r = await db.rawQuery(
+          'SELECT nombre, tipo, lat, lon FROM lugares_osm WHERE tipo = ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? '
+          'LIMIT 600',
+          [tipo.name, lat - radio, lat + radio, lon - radio, lon + radio]);
+      if (r.isEmpty) continue;
+      final l = r.map(_lugarDe).map((x) => (lugar: x, m: Geo.dist(lat, lon, x.lat, x.lon))).toList()
+        ..sort((a, b) => a.m.compareTo(b.m));
+      return l.take(limite).toList();
+    }
+    return <({Lugar lugar, double m})>[];
   }
 
   Future<List<Poi>> pois() async =>
@@ -1471,6 +1891,16 @@ class CmdIrA extends Cmd {
   const CmdIrA(this.nombre);
 }
 
+class CmdCercano extends Cmd {
+  final TipoLugar tipo;
+  const CmdCercano(this.tipo);
+}
+
+class CmdGrabar extends Cmd {
+  final bool iniciar;
+  const CmdGrabar(this.iniciar);
+}
+
 class CmdSilenciar extends Cmd {
   const CmdSilenciar();
 }
@@ -1505,6 +1935,16 @@ Cmd interpretarComando(String original) {
       m = Modo.auto;
     }
     return m != null ? CmdModo(m) : CmdDesconocido(original);
+  }
+  if (tiene(['grabar recorrido', 'grabar ruta', 'grabar traza', 'inicia grabacion', 'iniciar grabacion'])) {
+    return const CmdGrabar(true);
+  }
+  if (tiene(['detener grabacion', 'parar grabacion', 'deten grabacion', 'terminar grabacion', 'detener recorrido'])) {
+    return const CmdGrabar(false);
+  }
+  final tipoLugar = tipoLugarDeTexto(t);
+  if (tipoLugar != null && tiene(['cerca', 'cercan', 'proxim', 'donde hay', 'donde esta', 'busca', 'buscar', 'necesito'])) {
+    return CmdCercano(tipoLugar);
   }
   if (irA != null) {
     final nombre = (irA.group(1) ?? '').trim();
@@ -2133,6 +2573,25 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
           ..strokeWidth = w);
   }
 
+  // 6b) capas con nombres desconocidos (otro esquema): se dibujan de forma genérica para que algo se vea
+  final genPol = ui.Path()..fillType = ui.PathFillType.evenOdd;
+  final genLin = ui.Path();
+  for (final capa in capas) {
+    if (_categoriaCapa(capa.nombre) != 0) continue;
+    final k = kDe(capa);
+    for (final f in capa.feats) {
+      if (f.tipo == 1) continue;
+      if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
+      _agregarTrazos(f.tipo == 3 ? genPol : genLin, f, k, ox, oy, cerrar: f.tipo == 3);
+    }
+  }
+  canvas.drawPath(genPol, relleno..color = const ui.Color(0x33909090));
+  canvas.drawPath(
+      genLin,
+      trazo
+        ..color = const ui.Color(0xFF777777)
+        ..strokeWidth = 2);
+
   // 7) etiquetas con anti-choques: lugares primero, luego nombres de calles
   final ocupados = <ui.Rect>[];
   final halo = ui.Paint()
@@ -2239,6 +2698,12 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
 
 // ---------------------------------------------------------------- proveedor de teselas
 
+class _TeselaDescartada implements Exception {
+  const _TeselaDescartada();
+  @override
+  String toString() => 'tesela descartada (había demasiadas pendientes)';
+}
+
 class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
   final List<Database> bases;
   final List<bool> vectorial; // por base: true = teselas pbf
@@ -2246,22 +2711,46 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
   final int x, y, z;
   const _ImagenMbTile(this.bases, this.vectorial, this.zMaxBase, this.x, this.y, this.z);
 
+  // Diagnóstico (se muestra en Ajustes → «Diagnóstico del mapa»)
+  static String ultimoError = '';
+  static int dibujadas = 0, sinDatos = 0, fallidas = 0;
+  static final Map<String, int> capasVistas = <String, int>{};
+
   // Teselas vectoriales ya decodificadas (las sub-teselas ampliadas comparten la madre) y cola de dibujo
   static final Map<String, List<_CapaVec>> _cache = <String, List<_CapaVec>>{};
-  static Future<void> _turno = Future<void>.value();
+  static final List<({Future<ui.Image?> Function() trabajo, Completer<ui.Image?> fin})> _pendientes =
+      <({Future<ui.Image?> Function() trabajo, Completer<ui.Image?> fin})>[];
+  static bool _dibujando = false;
 
   /// Dibuja de una en una y cede el hilo entre teselas para que la interfaz no se trabe.
-  static Future<T> _enCola<T>(Future<T> Function() trabajo) {
-    final completer = Completer<T>();
-    _turno = _turno.then((_) async {
-      try {
-        completer.complete(await trabajo());
-      } catch (e, s) {
-        completer.completeError(e, s);
+  /// Se atiende primero la tesela MÁS RECIENTE (lo que se ve ahora); si se acumulan más de 60
+  /// (p. ej. al alejar el zoom), las más viejas se descartan y flutter_map las pide otra vez si hacen falta.
+  static Future<ui.Image?> _enCola(Future<ui.Image?> Function() trabajo) {
+    final fin = Completer<ui.Image?>();
+    _pendientes.add((trabajo: trabajo, fin: fin));
+    while (_pendientes.length > 60) {
+      _pendientes.removeAt(0).fin.completeError(const _TeselaDescartada());
+    }
+    _arrancarCola();
+    return fin.future;
+  }
+
+  static Future<void> _arrancarCola() async {
+    if (_dibujando) return;
+    _dibujando = true;
+    try {
+      while (_pendientes.isNotEmpty) {
+        final t = _pendientes.removeLast();
+        try {
+          t.fin.complete(await t.trabajo());
+        } catch (e, st) {
+          t.fin.completeError(e, st);
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 2));
       }
-      await Future<void>.delayed(const Duration(milliseconds: 2));
-    });
-    return completer.future;
+    } finally {
+      _dibujando = false;
+    }
   }
 
   /// Lee la tesela de la tabla `tiles` (zoom_level, tile_column, tile_row, tile_data).
@@ -2287,20 +2776,31 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
     return frame.image;
   }
 
-  Future<ui.Image?> _vectorialDe(int i) {
+  Future<ui.Image?> _vectorialDe(int i) async {
     final zb = zMaxBase[i];
     final d = z > zb ? z - zb : 0;
-    if (d > 6) return Future<ui.Image?>.value(null);
+    if (d > 6) return null;
     final zd = z - d;
     final xd = x >> d, yd = y >> d;
     final sx = x & ((1 << d) - 1), sy = y & ((1 << d) - 1);
-    return _enCola<ui.Image?>(() async {
-      final clave = '$i/$zd/$xd/$yd';
-      var capas = _cache.remove(clave); // se reinserta al final: así el más antiguo es el primero
+    final clave = '$i/$zd/$xd/$yd';
+    // La lectura de la base NO pasa por la cola: las teselas sin datos (fuera de tu mapa) se resuelven al instante
+    final enCache = _cache[clave];
+    Uint8List? datos;
+    if (enCache == null) {
+      datos = await _leer(bases[i], zd, xd, yd);
+      if (datos == null) {
+        sinDatos++;
+        return null;
+      }
+    }
+    return _enCola(() async {
+      var capas = _cache.remove(clave) ?? enCache; // se reinserta al final: así el más antiguo es el primero
       if (capas == null) {
-        final datos = await _leer(bases[i], zd, xd, yd);
-        if (datos == null) return null;
-        capas = _decodificarMvt(_descomprimirTesela(datos));
+        capas = _decodificarMvt(_descomprimirTesela(datos!));
+        for (final c in capas) {
+          capasVistas[c.nombre] = (capasVistas[c.nombre] ?? 0) + c.feats.length;
+        }
       }
       _cache[clave] = capas;
       if (_cache.length > 20) _cache.remove(_cache.keys.first);
@@ -2313,7 +2813,10 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
       for (var i = 0; i < bases.length; i++) {
         if (vectorial[i]) {
           final img = await _vectorialDe(i);
-          if (img != null) return ImageInfo(image: img, scale: _pxTesela / 256.0);
+          if (img != null) {
+            dibujadas++;
+            return ImageInfo(image: img, scale: _pxTesela / 256.0);
+          }
         } else {
           if (z > zMaxBase[i]) continue;
           final datos = await _leer(bases[i], z, x, y);
@@ -2326,7 +2829,16 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
           }
         }
       }
-    } catch (_) {}
+    } on _TeselaDescartada {
+      rethrow; // no se guarda en caché: flutter_map la volverá a pedir
+    } catch (e, st) {
+      // Un fallo se ve en pantalla como una tesela rosada y queda anotado en el diagnóstico
+      fallidas++;
+      ultimoError = '$e\n${st.toString().split('\n').take(4).join('\n')}';
+      final rec = ui.PictureRecorder();
+      ui.Canvas(rec).drawRect(const ui.Rect.fromLTWH(0, 0, 256, 256), ui.Paint()..color = const ui.Color(0xFFFFD6D6));
+      return ImageInfo(image: await rec.endRecording().toImage(256, 256));
+    }
     return ImageInfo(image: await _transparente());
   }
 
@@ -2985,6 +3497,12 @@ class Controlador extends ChangeNotifier {
   bool vozActiva = true;
   bool escuchando = false;
   bool redCargada = false;
+  // Red vial muy grande (p. ej. un estado completo): solo se carga una zona alrededor de tu posición
+  Ventana? _ventanaRed;
+  bool _cargandoRed = false, _recargarRed = false, _redEsperaGps = false;
+  LatLng? _centroPendiente;
+  int _ultimaVentanaMs = 0;
+  static const int _umbralVentanaBytes = 150 * 1024 * 1024;
   String redEstado = 'Sin red vial: se usa ruta en línea recta';
   List<MapaLocal> mapas = [];
   // Rango de zoom real de los .mbtiles cargados y área que cubren (metadata "bounds")
@@ -3030,11 +3548,13 @@ class Controlador extends ChangeNotifier {
     voz.alError = _msg;
     await datos.abrir();
     await _leerAjustesDescarga();
+    await contarLugares();
+    unawaited(_repararRecorridos());
     await _recargar();
     await voz.iniciar();
     unawaited(stt.cargarModelo().then((_) => notifyListeners())); // modelo de voz en segundo plano
     await _abrirMapas();
-    await _cargarRedGuardada();
+    unawaited(_cargarRedGuardada()); // un archivo grande tarda: no bloquea el GPS ni los permisos
     await iniciarGps(); // ubicación (diálogo del sistema)
     _iniciarBrujula();
     await pedirPermisos();
@@ -3113,7 +3633,7 @@ class Controlador extends ChangeNotifier {
     _detenerBrujula(); // el sensor magnético solo se usa con la app visible (ahorra batería)
     await stt.cancelar();
     escuchando = false;
-    if (fase != Fase.navegando) await _detenerGps();
+    if (fase != Fase.navegando && !grabando) await _detenerGps();
   }
 
   LocationSettings _ajustes(bool conNotificacion) {
@@ -3123,8 +3643,8 @@ class Controlador extends ChangeNotifier {
         distanceFilter: 0,
         intervalDuration: Duration(seconds: modo.intervaloS),
         foregroundNotificationConfig: conNotificacion
-            ? const ForegroundNotificationConfig(
-                notificationTitle: 'Navegación en curso',
+            ? ForegroundNotificationConfig(
+                notificationTitle: fase == Fase.navegando ? 'Navegación en curso' : 'Grabando recorrido',
                 notificationText: 'Toca para volver al mapa',
                 enableWakeLock: true,
               )
@@ -3148,7 +3668,7 @@ class Controlador extends ChangeNotifier {
     gpsActivo = await Geolocator.isLocationServiceEnabled();
     final ultima = await Geolocator.getLastKnownPosition();
     if (ultima != null && ubic == null) _procesar(ultima);
-    _gpsConNotificacion = fase == Fase.navegando;
+    _gpsConNotificacion = fase == Fase.navegando || grabando;
     _sub = Geolocator.getPositionStream(locationSettings: _ajustes(_gpsConNotificacion))
         .listen(_procesar, onError: (Object e) => _msg('GPS: $e'));
     notifyListeners();
@@ -3173,6 +3693,8 @@ class Controlador extends ChangeNotifier {
     ubic = u;
     velKmh = _velSuave * 3.6;
     gpsActivo = true;
+    _vigilarVentana(u);
+    if (grabando) _grabarPunto(u);
     if (fase == Fase.navegando) {
       _progreso(u, previa);
     } else if (destino != null && ruta == null && !calculando) {
@@ -3236,6 +3758,7 @@ class Controlador extends ChangeNotifier {
     notifyListeners();
     try {
       final o = LatLng(u.latitude, u.longitude);
+      await _asegurarVentana(o, d);
       final r = await motor.calcular(o, d, modo,
           paradas: List<LatLng>.of(paradas), nombresParadas: List<String>.of(paradasNombres));
       opcionesRuta = <Ruta>[r];
@@ -3473,8 +3996,340 @@ class Controlador extends ChangeNotifier {
     etaS = null;
     if (!completada) ruta = null;
     notifyListeners();
-    if (_gpsConNotificacion) await iniciarGps(reiniciar: true); // quita la notificación de primer plano
+    if (_gpsConNotificacion && !grabando) await iniciarGps(reiniciar: true); // quita la notificación de primer plano
     await _recargar();
+  }
+
+
+  // ---------------------------------------------------- búsqueda sin internet
+  int totalLugaresOsm = 0;
+
+  Future<void> contarLugares() async {
+    totalLugaresOsm = await datos.totalLugares();
+    notifyListeners();
+  }
+
+  static final RegExp _reCoord = RegExp(r'^\s*(-?\d{1,2}(?:\.\d+)?)\s*[,; ]\s*(-?\d{1,3}(?:\.\d+)?)\s*$');
+
+  /// Busca en tus puntos guardados, en los lugares descargados de OSM, en los nombres de calles de la red vial
+  /// y acepta coordenadas ("20.67, -103.35"). No necesita internet.
+  Future<List<Resultado>> buscar(String texto) async {
+    final res = <Resultado>[];
+    final m = _reCoord.firstMatch(texto);
+    if (m != null) {
+      final la = double.parse(m.group(1)!), lo = double.parse(m.group(2)!);
+      if (la.abs() <= 90 && lo.abs() <= 180) {
+        res.add(Resultado('Coordenadas', '${la.toStringAsFixed(5)}, ${lo.toStringAsFixed(5)}', '📌', la, lo));
+      }
+    }
+    final norm = Fmt.normalizar(texto);
+    if (norm.length < 2) return res;
+    final u = ubic;
+    String aDist(double la, double lo) => u == null ? '' : ' · ${Fmt.dist(Geo.dist(u.latitude, u.longitude, la, lo))}';
+    for (final p in pois) {
+      if (Fmt.normalizar(p.nombre).contains(norm)) {
+        res.add(Resultado(p.nombre, 'Punto guardado${aDist(p.lat, p.lon)}', '📍', p.lat, p.lon));
+      }
+    }
+    for (final l in await datos.buscarLugares(norm, limite: 40)) {
+      res.add(Resultado(l.nombre, '${l.tipo.etiqueta}${aDist(l.lat, l.lon)}', l.tipo.icono, l.lat, l.lon));
+    }
+    final red = motor.red;
+    final vistasCalle = <String>{};
+    String claveCalle(String n, double la, double lo) => '$n|${(la / 0.05).round()}|${(lo / 0.05).round()}';
+    if (red != null) {
+      for (final c in red.buscarCalles(norm, limite: 30)) {
+        if (!vistasCalle.add(claveCalle(c.nombre, c.lat, c.lon))) continue;
+        res.add(Resultado(c.nombre, 'Calle${aDist(c.lat, c.lon)}', '🛣️', c.lat, c.lon));
+      }
+    }
+    if (_indicesCalles.isNotEmpty) {
+      // todo el archivo: primero las que empiezan con el texto y las más cercanas a ti
+      final hallados = await _buscarEnIndices(norm);
+      if (u != null) {
+        hallados.sort((a, b) {
+          if (a.empieza != b.empieza) return a.empieza ? -1 : 1;
+          return Geo.dist(u.latitude, u.longitude, a.lat, a.lon).compareTo(Geo.dist(u.latitude, u.longitude, b.lat, b.lon));
+        });
+      } else {
+        hallados.sort((a, b) => a.empieza == b.empieza ? 0 : (a.empieza ? -1 : 1));
+      }
+      final porNombre = <String, int>{};
+      var agregadas = 0;
+      for (final h in hallados) {
+        if (agregadas >= 40) break;
+        if ((porNombre[h.nombre] ?? 0) >= 2) continue;
+        if (!vistasCalle.add(claveCalle(h.nombre, h.lat, h.lon))) continue;
+        porNombre[h.nombre] = (porNombre[h.nombre] ?? 0) + 1;
+        agregadas++;
+        res.add(Resultado(h.nombre, 'Calle${aDist(h.lat, h.lon)}', '🛣️', h.lat, h.lon));
+      }
+    }
+    if (u != null) {
+      // lo más cercano primero dentro de cada grupo se conserva por orden de aparición; se ordena solo el total de lugares
+      res.sort((a, b) {
+        final ga = a.icono == '📌' ? 0 : 1, gb = b.icono == '📌' ? 0 : 1;
+        if (ga != gb) return ga - gb;
+        return Geo.dist(u.latitude, u.longitude, a.lat, a.lon).compareTo(Geo.dist(u.latitude, u.longitude, b.lat, b.lon));
+      });
+    }
+    return res.take(80).toList();
+  }
+
+  Future<void> irAResultado(Resultado r) => establecerDestino(LatLng(r.lat, r.lon), r.titulo);
+
+  Future<void> _irAPorNombre(String nombre) async {
+    final r = await buscar(nombre);
+    if (r.isEmpty) {
+      voz.hablar('No encontré un lugar llamado $nombre');
+      return;
+    }
+    await irAResultado(r.first);
+    voz.hablar('Destino ${r.first.titulo}. Di iniciar navegación para comenzar.');
+  }
+
+  /// El lugar de ese tipo más cercano a tu posición (de los descargados) se fija como destino.
+  Future<void> irAlMasCercano(TipoLugar tipo) async {
+    final u = ubic;
+    if (u == null) {
+      voz.hablar('Aún no tengo tu ubicación');
+      return _msg('Esperando señal GPS…');
+    }
+    final l = await datos.lugaresCercanos(tipo, u.latitude, u.longitude, limite: 1);
+    if (l.isEmpty) {
+      voz.hablar('No tengo lugares de ese tipo descargados cerca');
+      return _msg('No hay ${tipo.etiqueta.toLowerCase()} descargados cerca. Descárgalos en Ajustes → Descargar lugares.');
+    }
+    final x = l.first;
+    await establecerDestino(LatLng(x.lugar.lat, x.lugar.lon), x.lugar.nombre);
+    voz.hablar('${tipo.etiqueta} más cercano: ${x.lugar.nombre}, a ${Fmt.dist(x.m)}. Di iniciar navegación para comenzar.');
+  }
+
+  Future<List<({Lugar lugar, double m})>> cercanos(TipoLugar tipo) async {
+    final u = ubic;
+    if (u == null) return <({Lugar lugar, double m})>[];
+    return datos.lugaresCercanos(tipo, u.latitude, u.longitude, limite: 12);
+  }
+
+  Future<void> descargarLugares({
+    required Alcance alcance,
+    EstadoMx? estado,
+    Zona? municipio,
+    required Set<TipoLugar> tipos,
+    required Future<bool> Function(String) confirmar,
+  }) async {
+    if (descargando) return;
+    if (alcance != Alcance.pais && estado == null) return _msg('Elige un estado.');
+    if (alcance == Alcance.municipio && municipio == null) return _msg('Busca y elige un municipio.');
+    // En todo el país solo lo esencial (comida o tiendas de un país entero serían millones de lugares)
+    final sel = alcance == Alcance.pais
+        ? <TipoLugar>{TipoLugar.gasolinera, TipoLugar.hospital, TipoLugar.poblado}
+        : tipos;
+    if (sel.isEmpty) return _msg('Elige al menos un tipo de lugar.');
+    final lugar = alcance == Alcance.pais ? 'todo México' : (alcance == Alcance.estado ? estado!.nombre : municipio!.nombre);
+    if (!await confirmar('Lugares de $lugar: ${sel.map((t) => t.etiqueta).join(', ')}.\n\n'
+        'Fuente: OpenStreetMap (Overpass API). Puede tardar varios minutos. Se guardan en la base de la app para buscarlos sin internet.')) {
+      return;
+    }
+    _iniciarDescarga(false, 'Buscando la zona en OpenStreetMap…');
+    try {
+      final List<Zona> zonas;
+      if (alcance == Alcance.pais) {
+        zonas = await catalogo.estados(cancelado: () => _cancelarDescarga);
+      } else if (alcance == Alcance.estado) {
+        zonas = await catalogo.estados(uno: estado, cancelado: () => _cancelarDescarga);
+      } else {
+        zonas = <Zona>[municipio!];
+      }
+      final n = await DescargadorLugares(_overpass, datos).descargar(
+        zonas: zonas,
+        tipos: sel,
+        progreso: _progresoDescarga,
+        cancelado: () => _cancelarDescarga,
+      );
+      await contarLugares();
+      _msg('Lugares de $lugar listos ($n).');
+    } on ErrorDescarga catch (e) {
+      _msg(e.mensaje);
+    } catch (e) {
+      _msg('Falló la descarga de lugares: $e');
+    } finally {
+      _terminarDescarga();
+    }
+  }
+
+  Future<void> borrarLugaresOsm() async {
+    await datos.borrarLugares();
+    await contarLugares();
+    _msg('Lugares descargados borrados.');
+  }
+
+  // ---------------------------------------------------- grabación de recorridos (GPX)
+  bool grabando = false;
+  double grabadoM = 0;
+  int grabadosPuntos = 0;
+  int _grabInicioMs = 0;
+  final List<LatLng> trazaGrabada = <LatLng>[];
+  File? _gpxArchivo;
+  IOSink? _gpxSink;
+  Position? _ultimoGrabado;
+  List<LatLng> trazaVista = <LatLng>[]; // recorrido abierto desde la pestaña Recorridos
+
+  static String _iso(DateTime d) => d.toUtc().toIso8601String();
+  static const String _gpxCierre = '</trkseg></trk></gpx>\n';
+
+  Future<Directory> _carpetaRecorridos() => _carpeta('recorridos');
+
+  Future<void> iniciarGrabacion() async {
+    if (grabando) return;
+    if (_sub == null) await iniciarGps();
+    if (!permisoOk) return _msg('Concede el permiso de ubicación para grabar.');
+    final d = await _carpetaRecorridos();
+    final ahora = DateTime.now();
+    String dos(int v) => v.toString().padLeft(2, '0');
+    final nombre = 'recorrido_${ahora.year}${dos(ahora.month)}${dos(ahora.day)}_${dos(ahora.hour)}${dos(ahora.minute)}${dos(ahora.second)}.gpx';
+    _gpxArchivo = File(ruta_p.join(d.path, nombre));
+    _gpxSink = _gpxArchivo!.openWrite();
+    _gpxSink!.write('<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<gpx version="1.1" creator="Navegacion offline" xmlns="http://www.topografix.com/GPX/1/1">\n'
+        '<trk><name>${nombre.replaceAll('.gpx', '')}</name><trkseg>\n');
+    trazaGrabada.clear();
+    grabadoM = 0;
+    grabadosPuntos = 0;
+    _ultimoGrabado = null;
+    _grabInicioMs = DateTime.now().millisecondsSinceEpoch;
+    grabando = true;
+    await iniciarGps(reiniciar: true); // con notificación: la grabación sigue con la pantalla apagada
+    voz.hablar('Grabando recorrido');
+    notifyListeners();
+  }
+
+  void _grabarPunto(Position u) {
+    final sink = _gpxSink;
+    if (!grabando || sink == null || u.accuracy > 50) return;
+    final prev = _ultimoGrabado;
+    if (prev != null) {
+      final d = Geo.dist(prev.latitude, prev.longitude, u.latitude, u.longitude);
+      if (d < 4) return; // quieto o ruido del GPS
+      grabadoM += d;
+    }
+    _ultimoGrabado = u;
+    grabadosPuntos++;
+    trazaGrabada.add(LatLng(u.latitude, u.longitude));
+    sink.write('<trkpt lat="${u.latitude.toStringAsFixed(7)}" lon="${u.longitude.toStringAsFixed(7)}">'
+        '<ele>${u.altitude.toStringAsFixed(1)}</ele><time>${_iso(u.timestamp)}</time></trkpt>\n');
+  }
+
+  Future<void> detenerGrabacion() async {
+    if (!grabando) return;
+    grabando = false;
+    final sink = _gpxSink;
+    _gpxSink = null;
+    try {
+      sink?.write(_gpxCierre);
+      await sink?.flush();
+      await sink?.close();
+    } catch (_) {}
+    final nombre = _gpxArchivo == null ? '' : ruta_p.basename(_gpxArchivo!.path);
+    voz.hablar('Recorrido guardado');
+    _msg('Recorrido guardado: $nombre (${Fmt.dist(grabadoM)}).');
+    if (fase != Fase.navegando && _gpsConNotificacion) await iniciarGps(reiniciar: true);
+    notifyListeners();
+  }
+
+  /// Si la app se cerró grabando, el archivo quedó sin cierre: se completa para que sea un GPX válido.
+  Future<void> _repararRecorridos() async {
+    try {
+      final d = await _carpetaRecorridos();
+      for (final f in d.listSync().whereType<File>()) {
+        if (!f.path.toLowerCase().endsWith('.gpx') || f.path == _gpxArchivo?.path) continue;
+        final len = await f.length();
+        if (len < 20) continue;
+        final raf = await f.open();
+        try {
+          await raf.setPosition(len > 200 ? len - 200 : 0);
+          final cola = String.fromCharCodes(await raf.read(200));
+          if (!cola.contains('</gpx>')) await f.writeAsString('\n$_gpxCierre', mode: FileMode.append);
+        } finally {
+          await raf.close();
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<List<File>> recorridos() async {
+    final d = await _carpetaRecorridos();
+    final r = d.listSync().whereType<File>().where((f) => f.path.toLowerCase().endsWith('.gpx')).toList();
+    r.sort((a, b) => b.path.compareTo(a.path)); // más recientes primero
+    return r;
+  }
+
+  static final RegExp _rePt = RegExp(r'<trkpt\s+lat="([-\d.]+)"\s+lon="([-\d.]+)"');
+
+  /// Muestra un recorrido guardado sobre el mapa.
+  Future<void> verRecorrido(File f) async {
+    try {
+      final t = await f.readAsString();
+      trazaVista = [for (final m in _rePt.allMatches(t)) LatLng(double.parse(m.group(1)!), double.parse(m.group(2)!))];
+      if (trazaVista.length < 2) _msg('Ese recorrido no tiene puntos.');
+      notifyListeners();
+    } catch (e) {
+      _msg('No se pudo abrir el recorrido: $e');
+    }
+  }
+
+  void ocultarRecorrido() {
+    trazaVista = <LatLng>[];
+    notifyListeners();
+  }
+
+  Future<void> eliminarRecorrido(File f) async {
+    try {
+      await f.delete();
+    } catch (e) {
+      _msg('No se pudo borrar: $e');
+    }
+    notifyListeners();
+  }
+
+  /// Copia el archivo a la carpeta pública Descargas para pasarlo a otra app o a la computadora.
+  Future<void> exportarADescargas(File f) async {
+    if (!await _pedirPermisoDescargas()) {
+      return _msg('Sin el permiso «Acceso a todos los archivos» no puedo escribir en Descargas.');
+    }
+    for (final ruta in await _carpetasDescargas()) {
+      try {
+        if (!await Directory(ruta).exists()) continue;
+        await f.copy(ruta_p.join(ruta, ruta_p.basename(f.path)));
+        return _msg('Copiado a Descargas: ${ruta_p.basename(f.path)}');
+      } on FileSystemException {
+        continue;
+      }
+    }
+    _msg('No pude escribir en Descargas.');
+  }
+
+  /// Exporta tus puntos guardados como waypoints GPX a Descargas.
+  Future<void> exportarPuntosGpx() async {
+    if (pois.isEmpty) return _msg('No tienes puntos guardados.');
+    String esc(String t) => t.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    final b = StringBuffer('<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<gpx version="1.1" creator="Navegacion offline" xmlns="http://www.topografix.com/GPX/1/1">\n');
+    for (final p in pois) {
+      b.write('<wpt lat="${p.lat.toStringAsFixed(7)}" lon="${p.lon.toStringAsFixed(7)}"><name>${esc(p.nombre)}</name></wpt>\n');
+    }
+    b.write('</gpx>\n');
+    final tmp = File(ruta_p.join((await _carpeta('recorridos')).path, '..', 'puntos_guardados.gpx'));
+    await tmp.writeAsString(b.toString());
+    await exportarADescargas(tmp);
+    await _borrarSilencioso(tmp);
+  }
+
+  Future<void> copiarCoordenadas() async {
+    final u = ubic;
+    if (u == null) return _msg('Esperando señal GPS…');
+    await Clipboard.setData(ClipboardData(text: '${u.latitude.toStringAsFixed(6)}, ${u.longitude.toStringAsFixed(6)}'));
+    _msg('Coordenadas copiadas: ${u.latitude.toStringAsFixed(6)}, ${u.longitude.toStringAsFixed(6)}');
   }
 
   Future<void> confirmarLlegada() => limpiarDestino();
@@ -3591,14 +4446,11 @@ class Controlador extends ChangeNotifier {
         guardarPunto('', 'Campo', false);
         voz.hablar('Punto guardado');
       case CmdIrA(:final nombre):
-        final buscado = Fmt.normalizar(nombre);
-        final poi = pois.where((p) => Fmt.normalizar(p.nombre).contains(buscado)).firstOrNull;
-        if (poi == null) {
-          voz.hablar('No encontré un lugar llamado $nombre');
-        } else {
-          irAPoi(poi);
-          voz.hablar('Destino ${poi.nombre}. Di iniciar navegación para comenzar.');
-        }
+        unawaited(_irAPorNombre(nombre));
+      case CmdCercano(:final tipo):
+        unawaited(irAlMasCercano(tipo));
+      case CmdGrabar(:final iniciar):
+        unawaited(iniciar ? iniciarGrabacion() : detenerGrabacion());
       case CmdSilenciar():
         establecerVoz(false);
       case CmdActivarVoz():
@@ -3680,22 +4532,68 @@ class Controlador extends ChangeNotifier {
     return (await Permission.storage.request()).isGranted;
   }
 
-  Future<List<File>> _mbtilesEnDescargas() async {
-    for (final ruta in await _carpetasDescargas()) {
-      final dir = Directory(ruta);
-      try {
-        if (!await dir.exists()) continue;
-        final archivos = <File>[];
-        await for (final e in dir.list(followLinks: false)) {
-          if (e is File && e.path.toLowerCase().endsWith('.mbtiles')) archivos.add(e);
+  /// Raíces de la tarjeta SD (microSD) y carpetas habituales donde se guardan los archivos.
+  Future<List<String>> _carpetasSd() async {
+    final raices = <String>{};
+    try {
+      for (final d in await getExternalStorageDirectories() ?? const <Directory>[]) {
+        final i = d.path.indexOf('/Android');
+        if (i > 0 && !d.path.startsWith('/storage/emulated')) raices.add(d.path.substring(0, i));
+      }
+    } catch (_) {}
+    try {
+      final st = Directory('/storage');
+      if (await st.exists()) {
+        await for (final e in st.list(followLinks: false)) {
+          final n = ruta_p.basename(e.path);
+          if (n != 'emulated' && n != 'self') raices.add(e.path);
         }
-        return archivos;
+      }
+    } catch (_) {}
+    return <String>[
+      for (final r in raices) ...<String>['$r/Download', '$r/Descargas', '$r/Mapas', r],
+    ];
+  }
+
+  /// Archivos de la carpeta Descargas (o de la tarjeta SD si [sd]) que cumplen [filtro].
+  Future<List<File>> _archivosExternos(bool sd, bool Function(String) filtro) async {
+    final r = <File>[];
+    final vistos = <String>{};
+    for (final ruta in sd ? await _carpetasSd() : await _carpetasDescargas()) {
+      try {
+        final d = Directory(ruta);
+        if (!await d.exists()) continue;
+        await for (final e in d.list(followLinks: false)) {
+          if (e is File && filtro(e.path) && vistos.add(e.path)) r.add(e);
+        }
+        if (!sd) break; // en Descargas se usa la primera carpeta que exista
       } on FileSystemException {
         continue; // sin permiso sobre esta ruta
       }
     }
-    return <File>[];
+    return r;
   }
+
+  bool mapasEnSd = false, redEnSd = false; // de dónde se leen los archivos: false = Descargas, true = tarjeta SD
+  String get fuenteMapasTxt => mapasEnSd ? 'la tarjeta SD' : 'la carpeta Descargas';
+  String get fuenteRedTxt => redEnSd ? 'la tarjeta SD' : 'la carpeta Descargas';
+
+  Future<void> establecerMapasEnSd(bool v) async {
+    mapasEnSd = v;
+    await _guardarAjustes();
+    notifyListeners();
+    await buscarEnDescargas();
+  }
+
+  Future<void> establecerRedEnSd(bool v) async {
+    redEnSd = v;
+    await _guardarAjustes();
+    notifyListeners();
+    await buscarRedEnDescargas();
+  }
+
+  Future<List<File>> _mbtilesEnDescargas() =>
+      _archivosExternos(mapasEnSd, (p) => p.toLowerCase().endsWith('.mbtiles'));
 
   /// Formato declarado en la tabla metadata del MBTiles ("png", "jpg", "pbf"...).
   Future<String> _formatoMb(Database db) async {
@@ -3811,15 +4709,73 @@ class Controlador extends ChangeNotifier {
   /// Botón «Buscar en Descargas»: pide el permiso si falta y vuelve a leer la carpeta.
   Future<void> buscarEnDescargas() async {
     if (!await _pedirPermisoDescargas()) {
-      _msg('Sin el permiso «Acceso a todos los archivos» no puedo leer la carpeta Descargas.');
+      _msg('Sin el permiso «Acceso a todos los archivos» no puedo leer $fuenteMapasTxt.');
       return;
     }
     await _abrirMapas();
     if (mapas.any((m) => m.enDescargas)) {
-      _msg('Mapas cargados desde Descargas.');
+      _msg('Mapas cargados desde $fuenteMapasTxt.');
     } else {
-      _msg('No encontré archivos .mbtiles en la carpeta Descargas.');
+      _msg('No encontré archivos .mbtiles en $fuenteMapasTxt.${mapasEnSd ? ' ¿Está insertada la tarjeta?' : ''}');
     }
+  }
+
+  /// Informe de lo que contiene el mapa y de si se puede dibujar (para ver por qué no aparece la imagen).
+  Future<String> diagnosticoMapa() async {
+    final p = proveedorTiles;
+    final b = StringBuffer();
+    if (p is! ProveedorMbTiles || p.bases.isEmpty) return 'No hay mapas vectoriales abiertos.';
+    final lim = limitesMapa, u = ubic;
+    b.writeln('Mapas vectoriales abiertos: ${p.bases.length}');
+    b.writeln('Zoom con datos: $zoomMinTiles a $zoomMaxTiles');
+    if (lim != null) {
+      b.writeln('Área: ${lim.south.toStringAsFixed(3)}, ${lim.west.toStringAsFixed(3)} a '
+          '${lim.north.toStringAsFixed(3)}, ${lim.east.toStringAsFixed(3)}');
+      if (u != null) {
+        b.writeln(lim.contains(LatLng(u.latitude, u.longitude))
+            ? 'Tu ubicación está DENTRO del área del mapa.'
+            : 'Tu ubicación está FUERA del área del mapa (por eso se ve gris).');
+      }
+    }
+    for (var i = 0; i < p.bases.length; i++) {
+      b.writeln('— Base ${i + 1} (${p.vectorial[i] ? 'vectorial' : 'raster'}) —');
+      try {
+        final z = p.zMaxBase[i];
+        Map<String, Object?>? fila;
+        if (u != null) {
+          final n = 1 << z;
+          final latR = u.latitude * math.pi / 180.0;
+          final x = ((u.longitude + 180.0) / 360.0 * n).floor();
+          final y = ((1.0 - math.log(math.tan(latR) + 1.0 / math.cos(latR)) / math.pi) / 2.0 * n).floor();
+          final r = await p.bases[i].rawQuery(
+              'SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ? LIMIT 1',
+              [z, x, n - 1 - y]);
+          if (r.isNotEmpty) fila = r.first;
+        }
+        fila ??= (await p.bases[i].rawQuery('SELECT tile_data FROM tiles WHERE zoom_level = ? LIMIT 1', [z])).firstOrNull;
+        final d = fila?['tile_data'];
+        if (d is! Uint8List) {
+          b.writeln('No encontré ninguna tesela en el zoom $z.');
+          continue;
+        }
+        final crudo = d.length > 2 && d[0] == 0x1f && d[1] == 0x8b;
+        b.writeln('Tesela de prueba: ${d.length} bytes${crudo ? ' (gzip)' : ''}');
+        final capas = _decodificarMvt(_descomprimirTesela(d));
+        b.writeln('Capas: ${capas.isEmpty ? 'NINGUNA' : capas.map((c) => '${c.nombre}(${c.feats.length})').join(', ')}');
+        final img = await _dibujarVectorial(capas, z, 0, 0, 0);
+        b.writeln('Dibujo de prueba: OK (${img.width}×${img.height})');
+        img.dispose();
+      } catch (e) {
+        b.writeln('ERROR: $e');
+      }
+    }
+    b.writeln('');
+    b.writeln('Teselas dibujadas: ${_ImagenMbTile.dibujadas} · sin datos: ${_ImagenMbTile.sinDatos} · fallidas: ${_ImagenMbTile.fallidas}');
+    if (_ImagenMbTile.capasVistas.isNotEmpty) {
+      b.writeln('Capas vistas: ${_ImagenMbTile.capasVistas.entries.map((e) => '${e.key}(${e.value})').join(', ')}');
+    }
+    if (_ImagenMbTile.ultimoError.isNotEmpty) b.writeln('Último error: ${_ImagenMbTile.ultimoError}');
+    return b.toString();
   }
 
   Future<void> importarMapa() async {
@@ -3888,20 +4844,11 @@ class Controlador extends ChangeNotifier {
     final vistos = r.map((f) => ruta_p.basename(f.path).toLowerCase()).toSet();
     redEnDescargas.clear();
     if (await _tienePermisoDescargas()) {
-      for (final ruta in await _carpetasDescargas()) {
-        try {
-          final d = Directory(ruta);
-          if (!await d.exists()) continue;
-          await for (final e in d.list(followLinks: false)) {
-            // en Descargas solo .geojson (un .json suelto puede ser cualquier otra cosa)
-            if (e is File && e.path.toLowerCase().endsWith('.geojson') && vistos.add(ruta_p.basename(e.path).toLowerCase())) {
-              r.add(e);
-              redEnDescargas.add(e.path);
-            }
-          }
-          break;
-        } on FileSystemException {
-          continue;
+      // en la fuente elegida solo .geojson (un .json suelto puede ser cualquier otra cosa)
+      for (final e in await _archivosExternos(redEnSd, (p) => p.toLowerCase().endsWith('.geojson'))) {
+        if (vistos.add(ruta_p.basename(e.path).toLowerCase())) {
+          r.add(e);
+          redEnDescargas.add(e.path);
         }
       }
     }
@@ -3914,39 +4861,223 @@ class Controlador extends ChangeNotifier {
   /// Botón «Buscar en Descargas» de la red vial.
   Future<void> buscarRedEnDescargas() async {
     if (!await _pedirPermisoDescargas()) {
-      _msg('Sin el permiso «Acceso a todos los archivos» no puedo leer la carpeta Descargas.');
+      _msg('Sin el permiso «Acceso a todos los archivos» no puedo leer $fuenteRedTxt.');
       return;
     }
     await _cargarRedGuardada();
     _msg(redEnDescargas.isEmpty
-        ? 'No encontré archivos .geojson en la carpeta Descargas.'
-        : 'Red vial leída desde Descargas (${redEnDescargas.length} ${redEnDescargas.length == 1 ? 'archivo' : 'archivos'}).');
+        ? 'No encontré archivos .geojson en $fuenteRedTxt.${redEnSd ? ' ¿Está insertada la tarjeta?' : ''}'
+        : 'Red vial leída desde $fuenteRedTxt (${redEnDescargas.length} ${redEnDescargas.length == 1 ? 'archivo' : 'archivos'}).');
   }
 
   /// Carga TODAS las regiones guardadas en un solo grafo (se unen por coordenadas).
-  Future<void> _cargarRedGuardada() async {
+  static bool _dentroDe(Ventana v, LatLng p, double margen) =>
+      p.latitude >= v.s + margen && p.latitude <= v.n - margen && p.longitude >= v.w + margen && p.longitude <= v.e - margen;
+
+  /// Ancho de la zona de red vial que se lee en memoria (km). Más grande no cabe en 4 GB de RAM.
+  static const double anchoVentanaKm = 45;
+
+  /// Zona de [anchoVentanaKm] alrededor de [c]; si el destino está a menos de ~130 km, también lo incluye
+  /// (así se puede trazar la ruta hasta él).
+  static Ventana _ventanaPara(LatLng c, LatLng? d) {
+    var s = c.latitude, n = c.latitude, w = c.longitude, e = c.longitude;
+    if (d != null && (d.latitude - c.latitude).abs() < 1.2 && (d.longitude - c.longitude).abs() < 1.2) {
+      s = math.min(s, d.latitude);
+      n = math.max(n, d.latitude);
+      w = math.min(w, d.longitude);
+      e = math.max(e, d.longitude);
+    }
+    final mLat = (anchoVentanaKm / 2) / 111.0;
+    final mLon = mLat / math.max(0.2, math.cos(c.latitude * math.pi / 180.0));
+    return (s: s - mLat, w: w - mLon, n: n + mLat, e: e + mLon);
+  }
+
+  /// Punto al que se movió el mapa con el dedo (null = el mapa sigue tu GPS). La zona de red vial lo sigue.
+  LatLng? focoMapa;
+
+  void moverFocoMapa(LatLng? p) {
+    focoMapa = p;
+    final v = _ventanaRed;
+    if (p == null || v == null || _cargandoRed) return;
+    if (!_dentroDe(v, p, 0.08)) unawaited(_cargarRedGuardada(centro: p));
+  }
+
+  /// Carga las regiones guardadas en un solo grafo. Con archivos muy grandes carga solo una zona
+  /// alrededor de [centro] (o de tu ubicación) y la vuelve a cargar cuando te alejas.
+  Future<void> _cargarRedGuardada({LatLng? centro}) async {
+    if (_cargandoRed) {
+      _recargarRed = true; // se repite al terminar la carga en curso
+      _centroPendiente = centro ?? _centroPendiente;
+      return;
+    }
+    _cargandoRed = true;
+    try {
+      do {
+        _recargarRed = false;
+        final c = centro ?? _centroPendiente;
+        _centroPendiente = null;
+        centro = null;
+        await _cargarRedUnaVez(c);
+      } while (_recargarRed);
+    } finally {
+      _cargandoRed = false;
+    }
+  }
+
+  // ---- Índice de calles de TODO el archivo (para buscar fuera de la zona cargada en memoria) ----
+  final Map<String, String> _indicesCalles = <String, String>{}; // .geojson → archivo de índice
+  bool _indexando = false;
+  String indiceEstado = '';
+
+  Future<void> _prepararIndices(List<File> archivos) async {
+    if (_indexando) return;
+    _indexando = true;
+    try {
+      final dir = await _carpeta('indices');
+      final nuevos = <String, String>{};
+      for (final f in archivos) {
+        final st = f.statSync();
+        final clave = '${ruta_p.basename(f.path)}_${st.size}_${st.modified.millisecondsSinceEpoch ~/ 1000}'
+            .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+        final salida = ruta_p.join(dir.path, '$clave.idx');
+        if (!await File(salida).exists()) {
+          indiceEstado = 'Creando el índice de calles de ${ruta_p.basename(f.path)} (se hace una sola vez, puede tardar varios minutos)…';
+          notifyListeners();
+          final entrada = f.path;
+          try {
+            await Isolate.run(() => construirIndiceCalles(<String>[entrada, salida]));
+          } catch (e) {
+            indiceEstado = 'No se pudo crear el índice de calles: $e';
+            notifyListeners();
+            continue;
+          }
+        }
+        nuevos[f.path] = salida;
+      }
+      final vivos = nuevos.values.toSet();
+      for (final x in dir.listSync().whereType<File>()) {
+        if (x.path.endsWith('.idx') && !vivos.contains(x.path)) {
+          try {
+            x.deleteSync();
+          } catch (_) {}
+        }
+      }
+      _indicesCalles
+        ..clear()
+        ..addAll(nuevos);
+      if (nuevos.isNotEmpty) indiceEstado = 'Índice de calles listo: las búsquedas recorren TODO el archivo, incluso fuera de la zona cargada.';
+      notifyListeners();
+    } finally {
+      _indexando = false;
+    }
+  }
+
+  /// Busca [norm] en los índices de calles (todo el archivo, en flujo: casi no usa memoria).
+  Future<List<({String nombre, double lat, double lon, bool empieza})>> _buscarEnIndices(String norm) async {
+    final r = <({String nombre, double lat, double lon, bool empieza})>[];
+    for (final ruta in _indicesCalles.values) {
+      try {
+        final lineas = File(ruta).openRead().transform(utf8.decoder).transform(const LineSplitter());
+        await for (final l in lineas) {
+          final k = l.indexOf(norm);
+          if (k < 0) continue;
+          final t = l.indexOf('\t');
+          if (t < 0 || k > t) continue; // la coincidencia debe estar en el nombre normalizado
+          final partes = l.split('\t');
+          if (partes.length < 4) continue;
+          final la = double.tryParse(partes[2]), lo = double.tryParse(partes[3]);
+          if (la == null || lo == null) continue;
+          r.add((nombre: partes[1], lat: la, lon: lo, empieza: k == 0));
+          if (r.length >= 600) return r;
+        }
+      } catch (_) {}
+    }
+    return r;
+  }
+
+  Future<void> _cargarRedUnaVez(LatLng? centro) async {
     final archivos = await _archivosRed();
     regionesRed = archivos;
     if (archivos.isEmpty) {
       motor.red = null;
       redCargada = false;
+      _ventanaRed = null;
       redEstado = 'Sin red vial: se usa ruta en línea recta';
       notifyListeners();
       return;
     }
-    redEstado = 'Cargando red vial…';
+    final bytes = archivos.fold<int>(0, (t, f) => t + f.lengthSync());
+    Ventana? v;
+    LatLng? cVentana;
+    if (bytes > _umbralVentanaBytes) {
+      final u = ubic;
+      final c = centro ?? focoMapa ?? (u != null ? LatLng(u.latitude, u.longitude) : destino);
+      cVentana = c;
+      if (c == null) {
+        _redEsperaGps = true;
+        redEstado = 'Red vial grande (${(bytes / 1048576).round()} MB): espero tu ubicación GPS para cargar la zona.';
+        notifyListeners();
+        return;
+      }
+      v = _ventanaPara(c, destino);
+    }
+    _redEsperaGps = false;
+    redEstado = v == null
+        ? 'Cargando red vial… (un archivo grande puede tardar varios minutos)'
+        : 'Cargando la zona de ${anchoVentanaKm.round()} km de red vial… (puede tardar un par de minutos)';
     notifyListeners();
     try {
-      final n = await motor.cargar(archivos.map((f) => f.path).toList());
+      final rutasRed = archivos.map((f) => f.path).toList();
+      int n;
+      try {
+        n = await motor.cargar(rutasRed, v);
+      } catch (e) {
+        final dest = destino;
+        if (v == null || dest == null || cVentana == null) rethrow;
+        // la zona ampliada hasta el destino no cabe en memoria: se carga solo la de 45 km alrededor del centro
+        v = _ventanaPara(cVentana, null);
+        n = await motor.cargar(rutasRed, v);
+        _msg('El destino queda fuera de la zona que cabe en memoria (${anchoVentanaKm.round()} km): ruta en línea recta hasta salir de ella.');
+      }
       redCargada = true;
-      redEstado = 'Red vial cargada ($n nodos, ${archivos.length} ${archivos.length == 1 ? 'región' : 'regiones'})';
+      _ventanaRed = v;
+      final ligero = bytes > 400 * 1024 * 1024;
+      redEstado = 'Red vial cargada ($n nodos, ${archivos.length} ${archivos.length == 1 ? 'archivo' : 'archivos'})'
+          '${v != null ? ' · solo la zona de ${anchoVentanaKm.round()} km alrededor de tu posición o del mapa (se actualiza al moverte)' : ''}'
+          '${ligero ? ' · modo ligero: sin senderos, ciclovías ni vías de servicio' : ''}';
       notifyListeners();
-      if (destino != null && fase != Fase.navegando) _calcularRuta();
+      if (v != null) unawaited(_prepararIndices(archivos)); // índice de calles de TODO el archivo (una sola vez)
+      if (destino != null && fase != Fase.navegando && !calculando) unawaited(_calcularRuta());
     } catch (e) {
       redCargada = false;
-      redEstado = 'Red vial inválida o demasiado grande para este equipo: $e';
+      motor.red = null;
+      _ventanaRed = null;
+      redEstado = 'No se pudo cargar la red vial: $e'
+          '${bytes > _umbralVentanaBytes ? '' : ' (archivo inválido o demasiado grande para este equipo)'}';
       notifyListeners();
     }
+  }
+
+  /// Si la zona cargada ya no cubre tu posición (o el destino), carga otra.
+  void _vigilarVentana(Position u) {
+    if (_cargandoRed) return;
+    final ahora = DateTime.now().millisecondsSinceEpoch;
+    if (ahora - _ultimaVentanaMs < 60000) return;
+    final p = focoMapa ?? LatLng(u.latitude, u.longitude);
+    final v = _ventanaRed;
+    if (_redEsperaGps || (v != null && !_dentroDe(v, p, 0.08))) {
+      _ultimaVentanaMs = ahora;
+      unawaited(_cargarRedGuardada(centro: p));
+    }
+  }
+
+  /// Antes de calcular una ruta: ¿el origen y el destino caben en la zona cargada?
+  Future<void> _asegurarVentana(LatLng o, LatLng d) async {
+    final v = _ventanaRed;
+    if (v == null || _cargandoRed) return;
+    final lejos = (d.latitude - o.latitude).abs() >= 1.2 || (d.longitude - o.longitude).abs() >= 1.2;
+    if (_dentroDe(v, o, 0.05) && (lejos || _dentroDe(v, d, 0.05))) return;
+    await _cargarRedGuardada(centro: o);
   }
 
   Future<void> eliminarRegionRed(File f) async {
@@ -3994,6 +5125,8 @@ class Controlador extends ChangeNotifier {
           plantillaTeselas = '${m['plantilla'] ?? ''}';
           evitarPeajes = m['evitarPeajes'] == true;
           evitarTerraceria = m['evitarTerraceria'] == true;
+          mapasEnSd = m['mapasEnSd'] == true;
+          redEnSd = m['redEnSd'] == true;
           motor.evitarPeajes = evitarPeajes;
           motor.evitarTerraceria = evitarTerraceria;
         }
@@ -4007,6 +5140,8 @@ class Controlador extends ChangeNotifier {
         'plantilla': plantillaTeselas,
         'evitarPeajes': evitarPeajes,
         'evitarTerraceria': evitarTerraceria,
+        'mapasEnSd': mapasEnSd,
+        'redEnSd': redEnSd,
       }));
     } catch (_) {}
   }
@@ -4261,9 +5396,18 @@ class PantallaPrincipal extends StatefulWidget {
 
 class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserver {
   final MapController _mapa = MapController();
-  bool _listo = false, _seguir = true, _centrado = false;
+  bool _listo = false, _seguir = true, _centrado = false, _ajustadoAlMapa = false;
   Ruta? _rutaVista;
   Fase _faseVista = Fase.inactiva;
+  Timer? _tFoco;
+
+  /// Zoom mínimo para que el ancho de la pantalla no abarque más de 45 km (a la latitud actual del mapa).
+  double _zoomMinimoVista() {
+    final w = MediaQuery.of(context).size.width;
+    final lat = _mapa.camera.center.latitude.clamp(-80.0, 80.0);
+    final z = math.log(w * 156543.03 * math.cos(lat * math.pi / 180.0) / (Controlador.anchoVentanaKm * 1000.0)) / math.ln2;
+    return z.clamp(3.0, 19.0);
+  }
 
   Controlador get c => widget.c;
 
@@ -4277,6 +5421,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
 
   @override
   void dispose() {
+    _tFoco?.cancel();
     c.removeListener(_alCambiar);
     c.brujula.removeListener(_alBrujula);
     WidgetsBinding.instance.removeObserver(this);
@@ -4340,10 +5485,15 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         ..showSnackBar(SnackBar(content: Text(m)));
     }
     final u = c.ubic;
+    if (_listo && u == null && !_centrado && !_ajustadoAlMapa && c.limitesMapa != null) {
+      _ajustadoAlMapa = true; // sin GPS todavía: se muestra el área del mapa descargado en vez de todo México
+      unawaited(_irAlAreaMapa());
+    }
     if (_listo && u != null) {
       final p = LatLng(u.latitude, u.longitude);
       if (!_centrado) {
         _centrado = true;
+        _seguir = true;
         _mapa.move(p, 16);
       } else if (_seguir) {
         _mapa.move(p, _mapa.camera.zoom);
@@ -4414,6 +5564,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                 const SizedBox(height: 8),
                 _botonRedondo(Icons.my_location, _seguir, () {
                   setState(() => _seguir = !_seguir);
+                  if (_seguir) c.moverFocoMapa(null); // vuelve a leerse la zona alrededor de tu GPS
                   final u = c.ubic;
                   if (_seguir && _listo && u != null) _mapa.move(LatLng(u.latitude, u.longitude), _mapa.camera.zoom);
                 }),
@@ -4441,13 +5592,29 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
       options: MapOptions(
         initialCenter: const LatLng(23.6345, -102.5528), // México; se recentra con el primer fix GPS
         initialZoom: 5,
-        minZoom: 3,
+        minZoom: c.mapas.isEmpty ? 3 : math.max(3, c.zoomMinTiles - 3).toDouble(),
         maxZoom: 19,
         backgroundColor: const Color(0xFFE0E0E0),
         onMapReady: () => _listo = true,
-        onLongPress: (_, ll) => c.establecerDestino(ll, 'Punto del mapa'),
+        onLongPress: (_, ll) => _alMantener(ll),
         onPositionChanged: (pos, hayGesto) {
           if (hayGesto && _seguir) setState(() => _seguir = false); // el usuario movió el mapa
+          if (!_listo) return;
+          // Límite de alejamiento: la vista no abarca más de ~45 km (lo que se lee en memoria)
+          if (c.mapas.isNotEmpty) {
+            final minZ = _zoomMinimoVista();
+            if (_mapa.camera.zoom < minZ - 0.02) {
+              _mapa.move(_mapa.camera.center, minZ);
+              return;
+            }
+          }
+          // La red vial se vuelve a leer alrededor de donde dejaste el mapa (con una pausa para no recargar a cada movimiento)
+          if (hayGesto) {
+            _tFoco?.cancel();
+            _tFoco = Timer(const Duration(seconds: 2), () {
+              if (mounted && !_seguir) c.moverFocoMapa(_mapa.camera.center);
+            });
+          }
         },
       ),
       children: [
@@ -4460,6 +5627,16 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
           maxZoom: 19,
           errorTileCallback: (tile, error, stack) {},
         ),
+        if (c.trazaVista.length >= 2)
+          PolylineLayer(polylines: [Polyline(points: c.trazaVista, strokeWidth: 4, color: Colors.purple.shade600)]),
+        if (c.grabando && c.trazaGrabada.length >= 2)
+          PolylineLayer(polylines: [Polyline(points: c.trazaGrabada, strokeWidth: 4, color: Colors.red.shade600)]),
+        if (c.opcionesRuta.length > 1 && c.fase != Fase.navegando)
+          PolylineLayer(polylines: [
+            for (var i = 0; i < c.opcionesRuta.length; i++)
+              if (i != c.idxRuta)
+                Polyline(points: c.opcionesRuta[i].puntos, strokeWidth: 5, color: Colors.blueGrey.shade300),
+          ]),
         if (r != null)
           PolylineLayer(polylines: [Polyline(points: r.puntos, strokeWidth: 6, color: Colors.blue.shade700)]),
         MarkerLayer(rotate: true, markers: [ // rotate: los pines no se giran con el mapa
@@ -4472,6 +5649,18 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
               child: GestureDetector(
                 onTap: () => c.irAPoi(p),
                 child: const Icon(Icons.flag, color: Colors.orange, size: 36),
+              ),
+            ),
+          for (var i = 0; i < c.paradas.length; i++)
+            Marker(
+              point: c.paradas[i],
+              width: 34,
+              height: 34,
+              alignment: Alignment.topCenter,
+              child: CircleAvatar(
+                radius: 14,
+                backgroundColor: Colors.deepPurple,
+                child: Text('${i + 1}', style: const TextStyle(color: Colors.white, fontSize: 13)),
               ),
             ),
           if (d != null)
@@ -4500,16 +5689,59 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
     );
   }
 
+  /// Mantener presionado: destino; si ya hay destino, se puede elegir entre cambiarlo o agregar una parada.
+  Future<void> _alMantener(LatLng ll) async {
+    if (c.destino == null || c.fase == Fase.navegando) {
+      return c.establecerDestino(ll, 'Punto del mapa');
+    }
+    final op = await showDialog<int>(
+      context: context,
+      builder: (ctx) => SimpleDialog(title: const Text('Punto del mapa'), children: [
+        SimpleDialogOption(onPressed: () => Navigator.pop(ctx, 1), child: const Text('Nuevo destino')),
+        SimpleDialogOption(onPressed: () => Navigator.pop(ctx, 2), child: const Text('Agregar como parada')),
+      ]),
+    );
+    if (op == 1) {
+      await c.establecerDestino(ll, 'Punto del mapa');
+    } else if (op == 2) {
+      await c.agregarParada(ll, 'Parada ${c.paradas.length + 1}');
+    }
+  }
+
   // ------------------------------------------------------------ superposiciones
   Widget _chipGps() {
     final u = c.ubic;
+    final extra = StringBuffer();
+    if (c.fase == Fase.navegando && c.calleActual.isNotEmpty) extra.write(' · ${c.calleActual}');
     return Card(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        child: Text(
-          u == null ? 'Buscando señal GPS…' : 'GPS ±${u.accuracy.round()} m · ${c.velKmh.round()} km/h',
-          style: const TextStyle(fontWeight: FontWeight.w600),
-        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          if (c.grabando) const Text('⏺ ', style: TextStyle(color: Colors.red)),
+          Flexible(
+            child: Text(
+              u == null ? 'Buscando señal GPS…' : 'GPS ±${u.accuracy.round()} m · ${c.velKmh.round()} km/h$extra',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          if (c.fase == Fase.navegando && c.limiteActual > 0) ...[
+            const SizedBox(width: 8),
+            Container(
+              width: 34,
+              height: 34,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Colors.white,
+                border: Border.all(color: c.velKmh > c.limiteActual + 5 ? Colors.red : Colors.red.shade300, width: 3),
+              ),
+              child: Text('${c.limiteActual}',
+                  style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 13)),
+            ),
+          ],
+        ]),
       ),
     );
   }
@@ -4632,6 +5864,24 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                             : '${Fmt.dur(eta)} · ${Fmt.hora(DateTime.now().add(Duration(seconds: eta)))}'),
                   ),
                 ]),
+                if (c.paradas.isNotEmpty)
+                  Wrap(spacing: 6, children: [
+                    for (var i = 0; i < c.paradas.length; i++)
+                      InputChip(
+                        label: Text('${i + 1}. ${c.paradasNombres[i]}', overflow: TextOverflow.ellipsis),
+                        onDeleted: c.fase == Fase.navegando ? null : () => c.quitarParada(i),
+                      ),
+                  ]),
+                if (c.opcionesRuta.length > 1 && c.fase != Fase.navegando)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: c.alternarRuta,
+                      icon: const Icon(Icons.alt_route),
+                      label: Text('Ruta ${c.idxRuta + 1} de ${c.opcionesRuta.length} · '
+                          '${Fmt.dist(c.ruta?.total ?? 0)} · ${Fmt.dur((c.ruta?.duracionS ?? 0).round())} (cambiar)'),
+                    ),
+                  ),
                 if (c.calculando) const Padding(padding: EdgeInsets.only(top: 6), child: LinearProgressIndicator()),
                 const SizedBox(height: 6),
                 Row(children: [
@@ -4652,11 +5902,17 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
               ],
               const SizedBox(height: 4),
               Row(children: [
+                _menu('🔎 Buscar', () => _abrirMenu(0)),
+                _menu('📍 Lugares', () => _abrirMenu(1)),
+                _menu('🔁 Rutas', () => _abrirMenu(2)),
+                _menu('🕘 Historial', () => _abrirMenu(4)),
+                _menu('⚙️ Ajustes', () => _abrirMenu(5)),
+              ]),
+              Row(children: [
                 _menu('➕ Punto', () => dialogoPunto(context, c)),
-                _menu('📍 Lugares', () => _abrirMenu(0)),
-                _menu('🔁 Rutas', () => _abrirMenu(1)),
-                _menu('🕘 Historial', () => _abrirMenu(2)),
-                _menu('⚙️ Ajustes', () => _abrirMenu(3)),
+                _menu(c.grabando ? '⏹ Detener GPX' : '⏺ Grabar GPX', () => c.grabando ? c.detenerGrabacion() : c.iniciarGrabacion()),
+                _menu('🥾 Recorridos', () => _abrirMenu(3)),
+                _menu('📋 Coordenadas', c.copiarCoordenadas),
               ]),
             ],
           ]),
@@ -4695,14 +5951,16 @@ class PantallaMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 4,
+      length: 6,
       initialIndex: inicial,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Menú'),
-          bottom: const TabBar(tabs: [
+          bottom: const TabBar(isScrollable: true, tabs: [
+            Tab(text: 'Buscar'),
             Tab(text: 'Lugares'),
             Tab(text: 'Rutas'),
+            Tab(text: 'Recorridos'),
             Tab(text: 'Historial'),
             Tab(text: 'Ajustes'),
           ]),
@@ -4710,8 +5968,10 @@ class PantallaMenu extends StatelessWidget {
         body: ListenableBuilder(
           listenable: c,
           builder: (ctx, _) => TabBarView(children: [
+            PestanaBuscar(c),
             _lugares(ctx),
             _rutas(ctx),
+            PestanaRecorridos(c),
             _historial(ctx),
             _ajustes(ctx),
           ]),
@@ -4817,6 +6077,27 @@ class PantallaMenu extends StatelessWidget {
       ),
       Text('Reconocimiento de voz: ${c.stt.estadoModelo}', style: const TextStyle(fontSize: 12)),
       const Divider(),
+      const Text('Preferencias de ruta', style: TextStyle(fontWeight: FontWeight.bold)),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('Evitar peajes'),
+        value: c.evitarPeajes,
+        onChanged: c.establecerEvitarPeajes,
+      ),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('Evitar terracería'),
+        subtitle: const Text('Caminos de tierra solo si no hay otra opción'),
+        value: c.evitarTerraceria,
+        onChanged: c.establecerEvitarTerraceria,
+      ),
+      const Divider(),
+      const Text('Herramientas de campo', style: TextStyle(fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      OutlinedButton(onPressed: c.copiarCoordenadas, child: const Text('Copiar mis coordenadas')),
+      const SizedBox(height: 8),
+      OutlinedButton(onPressed: c.exportarPuntosGpx, child: const Text('Exportar mis puntos guardados (GPX) a Descargas')),
+      const Divider(),
       const Text('Permisos', style: TextStyle(fontWeight: FontWeight.bold)),
       const SizedBox(height: 8),
       FilledButton(onPressed: c.pedirTodosPermisos, child: const Text('Conceder permisos')),
@@ -4824,37 +6105,68 @@ class PantallaMenu extends StatelessWidget {
       OutlinedButton(onPressed: openAppSettings, child: const Text('Abrir ajustes de la app')),
       const Divider(),
       const Text('Mapas vectoriales offline (.mbtiles pbf)', style: TextStyle(fontWeight: FontWeight.bold)),
-      if (c.mapas.isEmpty) const Text('No hay mapas vectoriales. Copia el .mbtiles (pbf) a la carpeta Descargas y pulsa «Buscar en Descargas».'),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('Leer desde la tarjeta SD'),
+        subtitle: Text(c.mapasEnSd ? 'Ahora: tarjeta microSD' : 'Ahora: carpeta Descargas'),
+        value: c.mapasEnSd,
+        onChanged: c.establecerMapasEnSd,
+      ),
+      if (c.mapas.isEmpty) Text('No hay mapas vectoriales. Copia el .mbtiles (pbf) a ${c.fuenteMapasTxt} y pulsa «Buscar».'),
       for (final m in c.mapas)
         ListTile(
           contentPadding: EdgeInsets.zero,
           leading: Icon(m.enDescargas ? Icons.download_done : Icons.folder),
           title: Text(m.nombre, maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text('${m.enDescargas ? 'Leído desde Descargas' : 'Importado a la app'} · zoom ${c.zoomMinTiles}–${c.zoomMaxTiles}'),
+          subtitle: Text('${m.enDescargas ? 'Leído en sitio (${c.mapasEnSd ? 'tarjeta SD' : 'Descargas'})' : 'Importado a la app'} · zoom ${c.zoomMinTiles}–${c.zoomMaxTiles}'),
           trailing: m.enDescargas
               ? null
               : IconButton(onPressed: () => c.eliminarMapa(m), icon: const Icon(Icons.delete_outline)),
         ),
-      FilledButton(onPressed: c.buscarEnDescargas, child: const Text('Buscar en Descargas')),
+      FilledButton(onPressed: c.buscarEnDescargas, child: Text('Buscar en ${c.mapasEnSd ? 'la tarjeta SD' : 'Descargas'}')),
       const SizedBox(height: 8),
       OutlinedButton(onPressed: c.importarMapa, child: const Text('Elegir y copiar un .mbtiles…')),
+      if (c.mapas.isNotEmpty)
+        TextButton(
+          onPressed: () async {
+            final texto = await c.diagnosticoMapa();
+            if (!ctx.mounted) return;
+            await showDialog<void>(
+              context: ctx,
+              builder: (_) => AlertDialog(
+                title: const Text('Diagnóstico del mapa'),
+                content: SingleChildScrollView(child: SelectableText(texto, style: const TextStyle(fontSize: 12))),
+                actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cerrar'))],
+              ),
+            );
+          },
+          child: const Text('Diagnóstico del mapa'),
+        ),
       const Divider(),
       const Text('Red vial para enrutamiento', style: TextStyle(fontWeight: FontWeight.bold)),
       Text(c.redEstado),
+      if (c.indiceEstado.isNotEmpty) Text(c.indiceEstado, style: const TextStyle(fontSize: 12)),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('Leer desde la tarjeta SD'),
+        subtitle: Text(c.redEnSd ? 'Ahora: tarjeta microSD' : 'Ahora: carpeta Descargas'),
+        value: c.redEnSd,
+        onChanged: c.establecerRedEnSd,
+      ),
       for (final f in c.regionesRed)
         ListTile(
           contentPadding: EdgeInsets.zero,
           dense: true,
           leading: const Icon(Icons.alt_route),
           title: Text(ruta_p.basename(f.path), maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text('${c.redEnDescargas.contains(f.path) ? 'Leído desde Descargas' : 'Guardado en la app'} · ${_tamanoArchivo(f)}'),
+          subtitle: Text('${c.redEnDescargas.contains(f.path) ? 'Leído en sitio (${c.redEnSd ? 'tarjeta SD' : 'Descargas'})' : 'Guardado en la app'} · ${_tamanoArchivo(f)}'),
           trailing: c.redEnDescargas.contains(f.path)
               ? null
               : IconButton(onPressed: () => c.eliminarRegionRed(f), icon: const Icon(Icons.delete_outline)),
         ),
-      if (c.regionesRed.isEmpty) const Text('Copia tu .geojson a la carpeta Descargas y pulsa «Buscar en Descargas».'),
+      if (c.regionesRed.isEmpty) Text('Copia tu .geojson a ${c.fuenteRedTxt} y pulsa «Buscar».'),
       const SizedBox(height: 8),
-      FilledButton(onPressed: c.buscarRedEnDescargas, child: const Text('Buscar en Descargas')),
+      FilledButton(onPressed: c.buscarRedEnDescargas, child: Text('Buscar en ${c.redEnSd ? 'la tarjeta SD' : 'Descargas'}')),
       const SizedBox(height: 8),
       OutlinedButton(onPressed: c.importarRedVial, child: const Text('Elegir y copiar un .geojson…')),
       if (c.redCargada)
@@ -4878,6 +6190,13 @@ class PantallaMenu extends StatelessWidget {
         subtitle: const Text('País, estado o municipio'),
         children: [PanelDescarga(c, esMapa: false)],
       ),
+      ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        leading: const Icon(Icons.place_outlined),
+        title: const Text('Descargar lugares para buscar sin internet'),
+        subtitle: const Text('Gasolineras, hospitales, comercios, poblados…'),
+        children: [PanelDescarga(c, esMapa: false, esLugares: true)],
+      ),
       const SizedBox(height: 24),
     ]);
   }
@@ -4889,8 +6208,9 @@ class PantallaMenu extends StatelessWidget {
 
 class PanelDescarga extends StatefulWidget {
   final Controlador c;
-  final bool esMapa; // true = mapas MBTiles, false = red vial
-  const PanelDescarga(this.c, {required this.esMapa, super.key});
+  final bool esMapa; // true = mapas MBTiles
+  final bool esLugares; // true = lugares para buscar sin internet; con ambos en false = red vial
+  const PanelDescarga(this.c, {required this.esMapa, this.esLugares = false, super.key});
 
   @override
   State<PanelDescarga> createState() => _EstadoPanelDescarga();
@@ -4906,6 +6226,7 @@ class _EstadoPanelDescarga extends State<PanelDescarga> {
   bool _buscando = false;
   Detalle _detalle = Detalle.estandar;
   int _zMax = 12;
+  final Set<TipoLugar> _tipos = <TipoLugar>{TipoLugar.gasolinera, TipoLugar.hospital, TipoLugar.farmacia, TipoLugar.poblado};
 
   static int _zMinPara(Alcance a) => a == Alcance.pais ? 4 : (a == Alcance.estado ? 6 : 10);
   static int _zMaxPara(Alcance a) => a == Alcance.pais ? 8 : (a == Alcance.estado ? 12 : 15);
@@ -4966,6 +6287,14 @@ class _EstadoPanelDescarga extends State<PanelDescarga> {
         zMin: _zMinPara(_alcance),
         zMax: _zMax,
         plantilla: _txtUrl.text,
+        confirmar: _confirmar,
+      );
+    } else if (widget.esLugares) {
+      await c.descargarLugares(
+        alcance: _alcance,
+        estado: _estado,
+        municipio: _municipio,
+        tipos: _tipos,
         confirmar: _confirmar,
       );
     } else {
@@ -5072,6 +6401,31 @@ class _EstadoPanelDescarga extends State<PanelDescarga> {
               const SizedBox(width: 8),
               const Expanded(child: Text('Más zoom = más detalle y mucho más peso.', style: TextStyle(fontSize: 12))),
             ]),
+          ] else if (widget.esLugares) ...[
+            if (_alcance == Alcance.pais)
+              const Text('Para todo el país se descargan solo gasolineras, hospitales y poblados.')
+            else
+              Wrap(spacing: 6, runSpacing: 0, children: [
+                for (final t in TipoLugar.values)
+                  FilterChip(
+                    label: Text('${t.icono} ${t.etiqueta}'),
+                    selected: _tipos.contains(t),
+                    onSelected: ocupado
+                        ? null
+                        : (v) => setState(() {
+                              if (v) {
+                                _tipos.add(t);
+                              } else {
+                                _tipos.remove(t);
+                              }
+                            }),
+                  ),
+              ]),
+            const SizedBox(height: 4),
+            Text('Guardados: ${c.totalLugaresOsm} lugares. Sirven para buscar por nombre y para «gasolinera más cercana».',
+                style: const TextStyle(fontSize: 12)),
+            if (c.totalLugaresOsm > 0)
+              TextButton(onPressed: ocupado ? null : c.borrarLugaresOsm, child: const Text('Borrar lugares descargados')),
           ] else ...[
             if (_alcance == Alcance.pais)
               const Text('Para todo el país se descargan solo las carreteras principales '
@@ -5097,7 +6451,7 @@ class _EstadoPanelDescarga extends State<PanelDescarga> {
           FilledButton.icon(
             onPressed: ocupado ? null : _descargar,
             icon: const Icon(Icons.download),
-            label: Text(widget.esMapa ? 'Descargar mapa' : 'Descargar red vial'),
+            label: Text(widget.esMapa ? 'Descargar mapa' : (widget.esLugares ? 'Descargar lugares' : 'Descargar red vial')),
           ),
           if (miDescarga) ...[
             const SizedBox(height: 12),
@@ -5110,6 +6464,251 @@ class _EstadoPanelDescarga extends State<PanelDescarga> {
       );
       },
     );
+  }
+}
+
+
+// ============================================================================
+// 10C. BUSCAR SIN INTERNET Y RECORRIDOS GPX
+// ============================================================================
+
+class PestanaBuscar extends StatefulWidget {
+  final Controlador c;
+  const PestanaBuscar(this.c, {super.key});
+
+  @override
+  State<PestanaBuscar> createState() => _EstadoBuscar();
+}
+
+class _EstadoBuscar extends State<PestanaBuscar> {
+  final TextEditingController _txt = TextEditingController();
+  List<Resultado> _res = <Resultado>[];
+  bool _buscando = false;
+  String _ultima = '';
+  List<({Lugar lugar, double m})>? _cercanos;
+  TipoLugar? _tipoCercano;
+
+  @override
+  void dispose() {
+    _txt.dispose();
+    super.dispose();
+  }
+
+  Future<void> _buscar(String t) async {
+    _ultima = t;
+    setState(() {
+      _buscando = true;
+      _cercanos = null;
+    });
+    final r = await widget.c.buscar(t);
+    if (!mounted || _ultima != t) return;
+    setState(() {
+      _res = r;
+      _buscando = false;
+    });
+  }
+
+  Future<void> _verCercanos(TipoLugar t) async {
+    final r = await widget.c.cercanos(t);
+    if (!mounted) return;
+    setState(() {
+      _tipoCercano = t;
+      _cercanos = r;
+    });
+    if (r.isEmpty) {
+      widget.c._msg(widget.c.ubic == null
+          ? 'Esperando señal GPS…'
+          : 'No hay ${t.etiqueta.toLowerCase()} descargados cerca. Descárgalos en Ajustes.');
+    }
+  }
+
+  void _ir(Resultado r) {
+    widget.c.irAResultado(r);
+    Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.c;
+    return Column(children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+        child: TextField(
+          controller: _txt,
+          textInputAction: TextInputAction.search,
+          decoration: InputDecoration(
+            labelText: 'Calle, lugar o coordenadas',
+            helperText: c.motor.red == null && c.totalLugaresOsm == 0
+                ? 'Para buscar calles carga una red vial; para lugares, descárgalos en Ajustes.'
+                : null,
+            prefixIcon: const Icon(Icons.search),
+            suffixIcon: IconButton(
+              icon: const Icon(Icons.clear),
+              onPressed: () {
+                _txt.clear();
+                setState(() {
+                  _res = <Resultado>[];
+                  _ultima = '';
+                });
+              },
+            ),
+          ),
+          onChanged: (t) {
+            if (t.trim().length >= 2) {
+              _buscar(t);
+            } else {
+              setState(() => _res = <Resultado>[]);
+            }
+          },
+          onSubmitted: _buscar,
+        ),
+      ),
+      SizedBox(
+        height: 44,
+        child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 8), children: [
+          for (final t in TipoLugar.values)
+            if (t != TipoLugar.poblado)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 3),
+                child: ActionChip(label: Text('${t.icono} ${t.etiqueta}'), onPressed: () => _verCercanos(t)),
+              ),
+        ]),
+      ),
+      if (_buscando) const LinearProgressIndicator(),
+      Expanded(
+        child: _cercanos != null
+            ? ListView(children: [
+                ListTile(
+                  title: Text('Más cercanos: ${_tipoCercano?.etiqueta ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  trailing: TextButton(onPressed: () => setState(() => _cercanos = null), child: const Text('Cerrar')),
+                ),
+                for (final x in _cercanos!)
+                  ListTile(
+                    leading: Text(x.lugar.tipo.icono, style: const TextStyle(fontSize: 24)),
+                    title: Text(x.lugar.nombre),
+                    subtitle: Text('A ${Fmt.dist(x.m)} en línea recta'),
+                    trailing: FilledButton(
+                        onPressed: () => _ir(Resultado(x.lugar.nombre, x.lugar.tipo.etiqueta, x.lugar.tipo.icono, x.lugar.lat, x.lugar.lon)),
+                        child: const Text('Ir')),
+                  ),
+              ])
+            : (_res.isEmpty
+                ? Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(_txt.text.trim().length >= 2 && !_buscando
+                        ? 'Sin resultados.'
+                        : 'Escribe el nombre de una calle, un lugar guardado o descargado, o coordenadas '
+                            '(por ejemplo 20.6736, -103.3440). Todo funciona sin internet.'))
+                : ListView.separated(
+                    itemCount: _res.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (_, i) {
+                      final r = _res[i];
+                      return ListTile(
+                        leading: Text(r.icono, style: const TextStyle(fontSize: 24)),
+                        title: Text(r.titulo, maxLines: 2, overflow: TextOverflow.ellipsis),
+                        subtitle: Text(r.detalle),
+                        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                          if (c.destino != null)
+                            IconButton(
+                              tooltip: 'Agregar como parada',
+                              icon: const Icon(Icons.add_location_alt_outlined),
+                              onPressed: () {
+                                c.agregarParada(LatLng(r.lat, r.lon), r.titulo);
+                                Navigator.pop(context);
+                              },
+                            ),
+                          FilledButton(onPressed: () => _ir(r), child: const Text('Ir')),
+                        ]),
+                      );
+                    },
+                  )),
+      ),
+    ]);
+  }
+}
+
+class PestanaRecorridos extends StatefulWidget {
+  final Controlador c;
+  const PestanaRecorridos(this.c, {super.key});
+
+  @override
+  State<PestanaRecorridos> createState() => _EstadoRecorridos();
+}
+
+class _EstadoRecorridos extends State<PestanaRecorridos> {
+  int _version = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.c;
+    return ListView(padding: const EdgeInsets.all(12), children: [
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(c.grabando ? '⏺ Grabando recorrido' : 'Grabar recorrido (GPX)',
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            if (c.grabando)
+              Text('${Fmt.dist(c.grabadoM)} · ${c.grabadosPuntos} puntos · '
+                  '${Fmt.dur((DateTime.now().millisecondsSinceEpoch - c._grabInicioMs) ~/ 1000)}')
+            else
+              const Text('Guarda tu trayecto aunque se apague la pantalla (se muestra una notificación mientras graba).',
+                  style: TextStyle(fontSize: 12)),
+            const SizedBox(height: 8),
+            FilledButton.icon(
+              onPressed: () async {
+                if (c.grabando) {
+                  await c.detenerGrabacion();
+                } else {
+                  await c.iniciarGrabacion();
+                }
+                if (mounted) setState(() => _version++);
+              },
+              icon: Icon(c.grabando ? Icons.stop : Icons.fiber_manual_record),
+              label: Text(c.grabando ? 'Detener y guardar' : 'Iniciar grabación'),
+            ),
+          ]),
+        ),
+      ),
+      if (c.trazaVista.isNotEmpty)
+        TextButton(onPressed: c.ocultarRecorrido, child: const Text('Quitar recorrido del mapa')),
+      FutureBuilder<List<File>>(
+        key: ValueKey<int>(_version + (c.grabando ? 1000 : 0)),
+        future: c.recorridos(),
+        builder: (ctx, snap) {
+          final l = snap.data ?? <File>[];
+          if (l.isEmpty) return const Padding(padding: EdgeInsets.all(8), child: Text('Aún no hay recorridos guardados.'));
+          return Column(children: [
+            for (final f in l)
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.route),
+                title: Text(ruta_p.basename(f.path).replaceAll('.gpx', ''), maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text(PantallaMenu._tamanoArchivo(f)),
+                trailing: PopupMenuButton<String>(
+                  onSelected: (v) async {
+                    if (v == 'ver') {
+                      await c.verRecorrido(f);
+                      if (ctx.mounted) Navigator.pop(ctx);
+                    } else if (v == 'exportar') {
+                      await c.exportarADescargas(f);
+                    } else if (v == 'borrar') {
+                      await c.eliminarRecorrido(f);
+                      if (mounted) setState(() => _version++);
+                    }
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem<String>(value: 'ver', child: Text('Ver en el mapa')),
+                    PopupMenuItem<String>(value: 'exportar', child: Text('Copiar a Descargas')),
+                    PopupMenuItem<String>(value: 'borrar', child: Text('Borrar')),
+                  ],
+                ),
+              ),
+          ]);
+        },
+      ),
+    ]);
   }
 }
 
@@ -5292,4 +6891,3 @@ class _PintorDial extends CustomPainter {
   @override
   bool shouldRepaint(covariant _PintorDial o) => o.color != color || o.norte != norte;
 }
-
