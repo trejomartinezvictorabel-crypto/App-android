@@ -4680,6 +4680,15 @@ class Controlador extends ChangeNotifier {
         }
       }
     } catch (_) {}
+    try {
+      // En Android 11+ listar /storage puede estar bloqueado: se leen también los montajes del sistema
+      for (final l in await File('/proc/mounts').readAsLines()) {
+        final partes = l.split(' ');
+        if (partes.length < 2) continue;
+        final m = RegExp(r'^/storage/([A-Za-z0-9]{4}-[A-Za-z0-9]{4})').firstMatch(partes[1]);
+        if (m != null) raices.add('/storage/${m.group(1)}');
+      }
+    } catch (_) {}
     return <String>[
       for (final r in raices) ...<String>['$r/Download', '$r/Descargas', '$r/Mapas', r],
     ];
@@ -4790,11 +4799,33 @@ class Controlador extends ChangeNotifier {
 
   /// Abre los .mbtiles de Descargas (si hay permiso) y los importados al almacenamiento propio.
   /// Los de Descargas se leen EN SITIO: no se copian ni se duplica el espacio.
-  Future<void> _abrirMapas() async {
-    for (final d in _basesMb) {
-      await d.close();
+  // Solo una apertura a la vez: si se llama mientras otra está en curso (permisos, botones, arranque…) se repite
+  // al terminar. Antes dos aperturas simultáneas mezclaban sus bases y fallaba cada tesela con RangeError.
+  Future<void>? _tareaMapas;
+  bool _repetirMapas = false;
+
+  Future<void> _abrirMapas() {
+    final en = _tareaMapas;
+    if (en != null) {
+      _repetirMapas = true;
+      return en;
     }
-    _basesMb.clear();
+    final t = () async {
+      try {
+        do {
+          _repetirMapas = false;
+          await _abrirMapasUnaVez();
+        } while (_repetirMapas);
+      } finally {
+        _tareaMapas = null;
+      }
+    }();
+    _tareaMapas = t;
+    return t;
+  }
+
+  Future<void> _abrirMapasUnaVez() async {
+    final nuevas = <Database>[]; // se publican de golpe al final; nada compartido cambia durante los await
 
     final candidatos = <MapaLocal>[];
     final propia = await _carpeta('mapas');
@@ -4854,7 +4885,7 @@ class Controlador extends ChangeNotifier {
         }
         flagsVec.add(esVec);
         zMaxBases.add(b is int ? b : 19);
-        _basesMb.add(db);
+        nuevas.add(db);
         validos.add(m);
       } catch (_) {
         await db?.close();
@@ -4866,9 +4897,19 @@ class Controlador extends ChangeNotifier {
     zoomMaxTiles = zMax >= 0 ? zMax : 19;
     limitesMapa = unionBounds;
     hayVectorial = flagsVec.contains(true);
-    proveedorTiles = ProveedorMbTiles(List<Database>.of(_basesMb), flagsVec, zMaxBases);
+    final viejas = List<Database>.of(_basesMb);
+    _basesMb
+      ..clear()
+      ..addAll(nuevas);
+    proveedorTiles = ProveedorMbTiles(List<Database>.of(nuevas), flagsVec, zMaxBases);
     versionMapas++;
     notifyListeners();
+    for (final d in viejas) {
+      try {
+        await d.close();
+      } catch (_) {}
+    }
+    Registro.anotar('Mapas abiertos: ${nuevas.length} (${mapas.map((m) => m.nombre).join(', ')})');
     if (raster.isNotEmpty && validos.isEmpty) {
       _msg('${raster.join(', ')} es un mapa RASTER y se ignora: esta app solo usa mapas vectoriales (.mbtiles con teselas pbf).');
     } else if (invalidos.isNotEmpty) {
@@ -4923,6 +4964,23 @@ class Controlador extends ChangeNotifier {
     b.writeln('Voz: ${stt.estadoModelo}');
     for (final sd in <bool>[false, true]) {
       b.writeln('\n--- ${sd ? 'Tarjeta SD' : 'Descargas'} ---');
+      if (sd) {
+        try {
+          final ds = await getExternalStorageDirectories();
+          b.writeln('Almacenes que reporta Android: ${ds == null || ds.isEmpty ? 'ninguno' : ds.map((d) => d.path).join(' | ')}');
+        } catch (e) {
+          b.writeln('Almacenes que reporta Android: error ($e)');
+        }
+        try {
+          final nombres = <String>[];
+          await for (final e in Directory('/storage').list(followLinks: false)) {
+            nombres.add(ruta_p.basename(e.path));
+          }
+          b.writeln('Contenido de /storage: ${nombres.join(', ')}');
+        } catch (e) {
+          b.writeln('No pude listar /storage: $e');
+        }
+      }
       List<String> carpetas = <String>[];
       try {
         carpetas = sd ? await _carpetasSd() : await _carpetasDescargas();
@@ -5649,6 +5707,7 @@ void main() {
   // Todo error no atrapado queda en el registro y sale como aviso en pantalla
   final presentar = FlutterError.presentError;
   FlutterError.onError = (d) {
+    if (d.exception is _TeselaDescartada) return; // normal: se pidió demasiado a la vez, flutter_map la vuelve a pedir
     Registro.anotar('ERROR de Flutter: ${d.exceptionAsString()}', aviso: true);
     presentar(d);
   };
