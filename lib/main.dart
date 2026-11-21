@@ -149,6 +149,35 @@ enum Modo {
   static const List<double> _transp = [70, 60, 40, 35, 30, 20, 0, 0, 0, 0];
   static const List<double> _pie = [0, 5, 5, 5, 5, 5, 5, 4.5, 5, 5];
 
+  /// Multiplicador del costo por tipo de vía (preferencias del modo): >1 = se evita, <1 = se prefiere.
+  /// Evita que el auto corte por estacionamientos/callejones, que la bici use troncales o que el peatón camine
+  /// junto a vías rápidas cuando hay una alternativa razonable.
+  double factorVia(ClaseVia c) {
+    switch (this) {
+      case Modo.auto:
+      case Modo.moto:
+        if (c == ClaseVia.servicio) return 2.2;
+        if (c == ClaseVia.local) return 1.12;
+        if (c == ClaseVia.terraceria) return 1.5;
+        return 1.0;
+      case Modo.bici:
+        if (c == ClaseVia.troncal) return 2.5;
+        if (c == ClaseVia.primaria) return 1.6;
+        if (c == ClaseVia.secundaria) return 1.25;
+        if (c == ClaseVia.ciclovia) return 0.8;
+        if (c == ClaseVia.terraceria) return 1.4;
+        return 1.0;
+      case Modo.pie:
+        if (c == ClaseVia.troncal) return 3.0;
+        if (c == ClaseVia.primaria) return 1.5;
+        if (c == ClaseVia.peatonal) return 0.85;
+        return 1.0;
+      case Modo.transporte:
+        if (c == ClaseVia.local) return 1.2;
+        return 1.0;
+    }
+  }
+
   double velEnVia(ClaseVia c) {
     switch (this) {
       case Modo.auto:
@@ -288,6 +317,7 @@ class Fmt {
 
 enum TipoGiro {
   salida('⬆'),
+  recto('⬆'),
   ligeroDer('↗'),
   der('➡'),
   cerradoDer('↘'),
@@ -328,15 +358,38 @@ class Ruta {
 /// Convierte la polilínea en instrucciones de giro en español.
 /// [calles]: nombre de la calle de cada segmento (pts[i] → pts[i+1]).
 /// [paradas]: índice de vértice → texto de la parada intermedia que termina ahí.
+/// [cruces]: por vértice, true si ahí hay una intersección real (3+ vías). Solo en intersecciones (o al cambiar de
+/// calle) se anuncia algo: las curvas suaves de una misma calle ya no generan «Gira…» falsos.
 List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum,
-    {List<String> calles = const <String>[], Map<int, String> paradas = const <int, String>{}}) {
-  const distRef = 12.0, angMin = 30.0, sepMin = 25.0;
+    {List<String> calles = const <String>[],
+    Map<int, String> paradas = const <int, String>{},
+    List<bool> cruces = const <bool>[]}) {
+  const distRef = 15.0, angMin = 28.0, sepMin = 30.0, angMismaCalle = 45.0, angCurvaCerrada = 100.0;
   final res = <Maniobra>[];
   if (pts.length < 2) return res;
+  final n = pts.length;
   String calleEn(int seg) => seg >= 0 && seg < calles.length ? calles[seg] : '';
+  bool esCruce(int i) => cruces.isEmpty ? true : (i < cruces.length ? cruces[i] : false);
+  // Calle por la que llegas al vértice i (busca hacia atrás hasta 120 m si el segmento no tiene nombre)
+  String entrante(int i) {
+    for (var s = i - 1; s >= 0 && acum[i] - acum[s] < 120; s--) {
+      final c = calleEn(s);
+      if (c.isNotEmpty) return c;
+    }
+    return '';
+  }
+
+  // Calle por la que sigues después del vértice i (hasta 100 m adelante)
+  String saliente(int i) {
+    for (var s = i; s < n - 1 && acum[s] - acum[i] < 100; s++) {
+      final c = calleEn(s);
+      if (c.isNotEmpty) return c;
+    }
+    return '';
+  }
 
   var primera = '';
-  for (var s = 0; s < pts.length - 1 && s < calles.length && acum[s] < 300; s++) {
+  for (var s = 0; s < n - 1 && s < calles.length && acum[s] < 300; s++) {
     if (calles[s].isNotEmpty) {
       primera = calles[s];
       break;
@@ -345,10 +398,31 @@ List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum,
   res.add(Maniobra(0, pts[0], TipoGiro.salida,
       'Dirígete al ${Geo.cardinal(Geo.rumbo(pts[0], pts[1]))}${primera.isEmpty ? '' : ' por $primera'}', 0));
   var ultima = -sepMin;
-  for (var i = 1; i < pts.length - 1; i++) {
+  for (var i = 1; i < n - 1; i++) {
     final parada = paradas[i];
     if (parada != null) {
       res.add(Maniobra(i, pts[i], TipoGiro.parada, 'Llegas a $parada', acum[i]));
+      ultima = acum[i];
+      continue;
+    }
+    final cruce = esCruce(i);
+    final nIn = entrante(i), nOut = saliente(i);
+    final cambioNombre = nIn.isNotEmpty && nOut.isNotEmpty && Fmt.normalizar(nIn) != Fmt.normalizar(nOut);
+    if (!cruce && !cambioNombre) {
+      // Sin intersección ni cambio de calle: solo una curva muy cerrada (horquilla) merece aviso
+      var j0 = i - 1;
+      while (j0 > 0 && acum[i] - acum[j0] < distRef * 2) {
+        j0--;
+      }
+      var k0 = i + 1;
+      while (k0 < n - 1 && acum[k0] - acum[i] < distRef * 2) {
+        k0++;
+      }
+      final d0 = Geo.difAng(Geo.rumbo(pts[j0], pts[i]), Geo.rumbo(pts[i], pts[k0]));
+      if (d0.abs() < angCurvaCerrada || acum[i] - ultima < sepMin) continue;
+      final der0 = d0 > 0;
+      res.add(Maniobra(i, pts[i], der0 ? TipoGiro.cerradoDer : TipoGiro.cerradoIzq,
+          der0 ? 'Curva cerrada a la derecha' : 'Curva cerrada a la izquierda', acum[i]));
       ultima = acum[i];
       continue;
     }
@@ -357,13 +431,29 @@ List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum,
       j--;
     }
     var k = i + 1;
-    while (k < pts.length - 1 && acum[k] - acum[i] < distRef) {
+    while (k < n - 1 && acum[k] - acum[i] < distRef) {
       k++;
     }
     final delta = Geo.difAng(Geo.rumbo(pts[j], pts[i]), Geo.rumbo(pts[i], pts[k]));
-    if (delta.abs() < angMin || acum[i] - ultima < sepMin) continue;
-    final der = delta > 0;
     final a = delta.abs();
+    final mismaCalle = nIn.isNotEmpty && nOut.isNotEmpty && !cambioNombre;
+    if (a < angMin || (mismaCalle && a < angMismaCalle)) {
+      // Sigue derecho: solo se avisa si en esta intersección cambia el nombre de la calle
+      if (cruce && cambioNombre && acum[i] - ultima >= sepMin) {
+        res.add(Maniobra(i, pts[i], TipoGiro.recto, 'Continúa por $nOut', acum[i]));
+        ultima = acum[i];
+      }
+      continue;
+    }
+    if (acum[i] - ultima < sepMin) {
+      // Intersección muy pegada a la anterior: un «Continúa» previo cede ante un giro real
+      if (res.isNotEmpty && res.last.tipo == TipoGiro.recto) {
+        res.removeLast();
+      } else {
+        continue;
+      }
+    }
+    final der = delta > 0;
     late TipoGiro tipo;
     late String texto;
     if (a >= 165) {
@@ -379,12 +469,11 @@ List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum,
       tipo = der ? TipoGiro.ligeroDer : TipoGiro.ligeroIzq;
       texto = der ? 'Gira ligeramente a la derecha' : 'Gira ligeramente a la izquierda';
     }
-    final saliente = calleEn(i);
-    if (saliente.isNotEmpty && saliente != calleEn(i - 1)) texto = '$texto en $saliente';
+    if (nOut.isNotEmpty && (cambioNombre || nIn.isEmpty)) texto = '$texto en $nOut';
     res.add(Maniobra(i, pts[i], tipo, texto, acum[i]));
     ultima = acum[i];
   }
-  final u = pts.length - 1;
+  final u = n - 1;
   res.add(Maniobra(u, pts[u], TipoGiro.llegada, 'Has llegado a tu destino', acum[u]));
   return res;
 }
@@ -503,6 +592,51 @@ class RedVial {
     return r;
   }
 
+  /// Intersecciones entre una calle que contiene [a] y otra que contiene [b] (textos ya normalizados),
+  /// dentro de la zona cargada. Un cruce = nodo al que llegan aristas de ambas calles.
+  List<({String a, String b, double lat, double lon})> cruces(String a, String b, {int limite = 15}) {
+    final res = <({String a, String b, double lat, double lon})>[];
+    if (a.length < 2 || b.length < 2) return res;
+    final flag = Uint8List(nombres.length);
+    var hayA = false, hayB = false;
+    for (var i = 0; i < nombresNorm.length; i++) {
+      final t = nombresNorm[i];
+      if (t.contains(a)) {
+        flag[i] |= 1;
+        hayA = true;
+      }
+      if (t.contains(b)) {
+        flag[i] |= 2;
+        hayB = true;
+      }
+    }
+    if (!hayA || !hayB) return res;
+    final vistos = <String>{};
+    for (var u = 0; u < lats.length; u++) {
+      var ia = -1, ib = -1;
+      for (var e = offs[u]; e < offs[u + 1]; e++) {
+        final id = nombreE[e];
+        if (id >= 0 && (flag[id] & 1) != 0) {
+          ia = id;
+          break;
+        }
+      }
+      if (ia < 0) continue;
+      for (var e = offs[u]; e < offs[u + 1]; e++) {
+        final id = nombreE[e];
+        if (id >= 0 && id != ia && (flag[id] & 2) != 0) {
+          ib = id;
+          break;
+        }
+      }
+      if (ib < 0) continue;
+      if (!vistos.add('$ia|$ib|${(lats[u] / 0.0004).round()}|${(lons[u] / 0.0004).round()}')) continue;
+      res.add((a: nombres[ia], b: nombres[ib], lat: lats[u], lon: lons[u]));
+      if (res.length >= limite * 4) break;
+    }
+    return res;
+  }
+
   /// Rumbo aproximado (0..360) entre dos nodos, en plano local (barato: se usa dentro de A*).
   double _rumbo(int a, int b) {
     final dLat = lats[b] - lats[a];
@@ -583,7 +717,7 @@ class RedVial {
         if (vel <= 0) continue;
         if (lim && velMax[e] > 0) vel = math.min(vel, velMax[e] * 0.95);
         if (evitarTerraceria && cls == ClaseVia.terraceria) vel = vel / 4;
-        var costo = dist[e] / (vel / 3.6);
+        var costo = dist[e] / (vel / 3.6) * modo.factorVia(cls);
         if (evitarPeajes && (bits & 2) != 0) costo = costo * 2 + 900;
         if (penalizadas != null) {
           final pe = penalizadas[e];
@@ -1190,7 +1324,8 @@ class _Tramo {
   final double seg;
   final bool aprox;
   final List<int> aristas;
-  const _Tramo(this.pts, this.calles, this.lims, this.seg, this.aprox, this.aristas);
+  final List<bool> cruces; // una por vértice: ¿hay una intersección real ahí?
+  const _Tramo(this.pts, this.calles, this.lims, this.seg, this.aprox, this.aristas, this.cruces);
 }
 
 /// Motor de enrutamiento local: A* con red vial cargada; línea recta como respaldo.
@@ -1233,11 +1368,13 @@ class MotorRutas {
           final pts = <LatLng>[o];
           final calles = <String>[];
           final lims = <int>[];
+          final cruces = <bool>[false];
           for (var i = 0; i < camino.nodos.length; i++) {
             final n = camino.nodos[i];
             final c = LatLng(r.lats[n], r.lons[n]);
             if (Geo.distLL(pts.last, c) > 0.5) {
               pts.add(c);
+              cruces.add(i > 0 && i < camino.nodos.length - 1 && r.offs[n + 1] - r.offs[n] >= 3);
               if (i == 0) {
                 calles.add('');
                 lims.add(0);
@@ -1251,6 +1388,7 @@ class MotorRutas {
           }
           if (Geo.distLL(pts.last, d) > 0.5) {
             pts.add(d);
+            cruces.add(false);
             calles.add('');
             lims.add(0);
           }
@@ -1258,18 +1396,19 @@ class MotorRutas {
           final primero = LatLng(r.lats[camino.nodos.first], r.lons[camino.nodos.first]);
           final ultimo = LatLng(r.lats[camino.nodos.last], r.lons[camino.nodos.last]);
           final extra = (Geo.distLL(o, primero) + Geo.distLL(ultimo, d)) / vProm;
-          return _Tramo(pts, calles, lims, r.duracionAristas(camino.aristas, modo) + extra, false, camino.aristas);
+          return _Tramo(pts, calles, lims, r.duracionAristas(camino.aristas, modo) + extra, false, camino.aristas, cruces);
         }
       }
     }
     final dist = Geo.distLL(o, d);
-    return _Tramo(<LatLng>[o, d], <String>[''], <int>[0], dist / (modo.velProm / 3.6), true, const <int>[]);
+    return _Tramo(<LatLng>[o, d], <String>[''], <int>[0], dist / (modo.velProm / 3.6), true, const <int>[], const <bool>[false, false]);
   }
 
   Ruta _unir(List<_Tramo> tramos, Modo modo, List<String> nombresParadas) {
     final pts = <LatLng>[];
     final calles = <String>[];
     final lims = <int>[];
+    final cruces = <bool>[];
     final paradas = <int, String>{};
     var seg = 0.0;
     for (var t = 0; t < tramos.length; t++) {
@@ -1277,8 +1416,10 @@ class MotorRutas {
       seg += tr.seg;
       if (pts.isEmpty) {
         pts.addAll(tr.pts);
+        cruces.addAll(tr.cruces);
       } else {
         pts.addAll(tr.pts.skip(1)); // el primer punto coincide con la parada anterior
+        cruces.addAll(tr.cruces.skip(1));
       }
       calles.addAll(tr.calles);
       lims.addAll(tr.lims);
@@ -1287,17 +1428,17 @@ class MotorRutas {
         paradas[pts.length - 1] = 'la parada ${t + 1}${nombre.isEmpty ? '' : ', $nombre'}';
       }
     }
-    return _armar(pts, seg, tramos.every((t) => t.aprox), modo, calles, lims, paradas);
+    return _armar(pts, seg, tramos.every((t) => t.aprox), modo, calles, lims, paradas, cruces);
   }
 
   Ruta _armar(List<LatLng> entrada, double seg, bool aprox, Modo modo, List<String> calles, List<int> lims,
-      Map<int, String> paradas) {
+      Map<int, String> paradas, List<bool> cruces) {
     final pts = entrada.length < 2 ? <LatLng>[entrada[0], entrada[0]] : entrada;
     final acum = List<double>.filled(pts.length, 0);
     for (var i = 1; i < pts.length; i++) {
       acum[i] = acum[i - 1] + Geo.distLL(pts[i - 1], pts[i]);
     }
-    return Ruta(pts, acum, acum.last, seg, generarManiobras(pts, acum, calles: calles, paradas: paradas), aprox, modo,
+    return Ruta(pts, acum, acum.last, seg, generarManiobras(pts, acum, calles: calles, paradas: paradas, cruces: cruces.length == pts.length ? cruces : const <bool>[]), aprox, modo,
         limiteSeg: lims, calleSeg: calles);
   }
 
@@ -4165,6 +4306,26 @@ class Controlador extends ChangeNotifier {
       res.add(Resultado(l.nombre, '${l.tipo.etiqueta}${aDist(l.lat, l.lon)}', l.tipo.icono, l.lat, l.lon));
     }
     final red = motor.red;
+    // «Calle A y calle B», «esquina de A con B», «cruce de A y B»: busca la intersección
+    var buscoCruce = false, hayCruce = false;
+    if (red != null) {
+      var t = norm.replaceFirst(RegExp(r'^(esquina|cruce|interseccion|esq\.?)\s+(de\s+|con\s+|entre\s+)?'), '');
+      t = t.replaceFirst(RegExp(r'^entre\s+'), '');
+      final tk = t.split(RegExp(r'\s+'));
+      for (var k = 1; k < tk.length - 1; k++) {
+        if (!const {'y', 'e', 'con', '&', 'x'}.contains(tk[k])) continue;
+        buscoCruce = true;
+        final ca = tk.sublist(0, k).join(' '), cb = tk.sublist(k + 1).join(' ');
+        for (final x in red.cruces(ca, cb, limite: 10)) {
+          hayCruce = true;
+          res.add(Resultado('${x.a} y ${x.b}', 'Cruce${aDist(x.lat, x.lon)}', '🔀', x.lat, x.lon));
+        }
+        if (hayCruce) break;
+      }
+      if (buscoCruce && !hayCruce && res.isEmpty) {
+        _msg('No encontré ese cruce en la zona cargada. Mueve el mapa cerca de él (se lee ~45 km alrededor) e inténtalo otra vez.');
+      }
+    }
     final vistasCalle = <String>{};
     String claveCalle(String n, double la, double lo) => '$n|${(la / 0.05).round()}|${(lo / 0.05).round()}';
     if (red != null) {
@@ -5893,6 +6054,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
   @override
   void dispose() {
     _tFoco?.cancel();
+    _rotMapa.dispose();
     c.removeListener(_alCambiar);
     c.brujula.removeListener(_alBrujula);
     WidgetsBinding.instance.removeObserver(this);
@@ -5911,10 +6073,41 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
 
   int _ultimoGiroMs = 0;
   double _ultimoGiro = 0;
+  final ValueNotifier<double> _rotMapa = ValueNotifier<double>(0); // giro actual del mapa (para la brújula)
+  double _rumboNav = 0; // rumbo suavizado del GPS durante la navegación
+  bool _rumboNavInicial = false;
+  static const double _inclinacion = 0.62; // rad (~35°) de inclinación al navegar
+
+  bool get _modoNavegacion => c.fase == Fase.navegando && _seguir;
+
+  /// Navegando: el mapa gira para que «arriba» sea hacia donde avanzas (giras a la derecha → el mapa gira a la derecha).
+  void _girarSegunMarcha(Position u) {
+    final p = LatLng(u.latitude, u.longitude);
+    final h = u.heading;
+    if (u.speed >= 1.2 && h >= 0 && h < 361) {
+      if (!_rumboNavInicial) {
+        _rumboNav = h;
+        _rumboNavInicial = true;
+      } else {
+        _rumboNav = (_rumboNav + Geo.difAng(_rumboNav, h) * 0.4) % 360.0;
+      }
+    } else if (!_rumboNavInicial) {
+      final r = c.ruta;
+      if (r != null && r.puntos.length >= 2) {
+        _rumboNav = Geo.rumbo(r.puntos[0], r.puntos[1]);
+        _rumboNavInicial = true;
+      }
+    }
+    if (_rumboNavInicial) {
+      _mapa.moveAndRotate(p, _mapa.camera.zoom, -_rumboNav);
+    } else {
+      _mapa.move(p, _mapa.camera.zoom);
+    }
+  }
 
   /// Modo «rumbo arriba»: gira el mapa con la brújula (máx. ~10 veces/s y solo si cambia >2°).
   void _alBrujula() {
-    if (!mounted || !c.rumboArriba || !_listo) return;
+    if (!mounted || !c.rumboArriba || !_listo || c.fase == Fase.navegando) return;
     final h = c.brujula.value;
     if (h == null) return;
     final ahora = DateTime.now().millisecondsSinceEpoch;
@@ -5922,6 +6115,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
     _ultimoGiroMs = ahora;
     _ultimoGiro = h;
     _mapa.rotate(-h);
+    _rotMapa.value = -h;
   }
 
   void _alPulsarBrujula() {
@@ -5971,12 +6165,23 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         _seguir = true;
         _mapa.move(p, 16);
       } else if (_seguir) {
-        _mapa.move(p, _mapa.camera.zoom);
+        if (c.fase == Fase.navegando) {
+          _girarSegunMarcha(u);
+        } else {
+          _mapa.move(p, _mapa.camera.zoom);
+        }
       }
     }
     if (c.fase == Fase.navegando && _faseVista != Fase.navegando) {
       _seguir = true;
-      if (_listo && u != null) _mapa.move(LatLng(u.latitude, u.longitude), 17.5);
+      _rumboNavInicial = false;
+      if (_listo && u != null) {
+        _mapa.move(LatLng(u.latitude, u.longitude), 17.5);
+        _girarSegunMarcha(u);
+      }
+    }
+    if (c.fase != Fase.navegando && _faseVista == Fase.navegando && _listo) {
+      _mapa.rotate(0); // al terminar, el norte vuelve arriba
     }
     _faseVista = c.fase;
     final r = c.ruta;
@@ -6002,7 +6207,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         final esc = Theme.of(context).colorScheme;
         return Scaffold(
           body: Stack(children: [
-            Positioned.fill(child: _widgetMapa()),
+            Positioned.fill(child: _mapaInclinado()),
             SafeArea(
               child: Padding(
                 padding: const EdgeInsets.all(8),
@@ -6031,6 +6236,11 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
               top: MediaQuery.of(context).size.height * 0.26,
               child: Column(children: [
                 Brujula(
+                  rotacionMapa: _rotMapa,
+                  alReiniciarNorte: () {
+                    if (_listo) _mapa.rotate(0);
+                    _rotMapa.value = 0;
+                  },
                   rumbo: c.brujula,
                   disponible: c.brujulaDisponible,
                   rumboArriba: c.rumboArriba,
@@ -6058,6 +6268,30 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
   }
 
   // ----------------------------------------------------------------- mapa
+  /// Al navegar el mapa se inclina (perspectiva). El mapa se dibuja más grande que la pantalla para que la
+  /// parte lejana no quede en blanco; los botones y avisos NO se inclinan (están fuera de este widget).
+  Widget _mapaInclinado() {
+    if (!_modoNavegacion) return _widgetMapa();
+    return LayoutBuilder(builder: (context, k) {
+      final w = k.maxWidth, h = k.maxHeight;
+      return ClipRect(
+        child: Transform(
+          alignment: const Alignment(0, 0.55),
+          transform: Matrix4.identity()
+            ..setEntry(3, 2, 0.0007)
+            ..rotateX(-_inclinacion),
+          child: OverflowBox(
+            minWidth: w * 1.9,
+            maxWidth: w * 1.9,
+            minHeight: h * 1.9,
+            maxHeight: h * 1.9,
+            child: _widgetMapa(),
+          ),
+        ),
+      );
+    });
+  }
+
   Widget _widgetMapa() {
     final u = c.ubic;
     final r = c.ruta;
@@ -6075,6 +6309,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         onPositionChanged: (pos, hayGesto) {
           if (hayGesto && _seguir) setState(() => _seguir = false); // el usuario movió el mapa
           if (!_listo) return;
+          if ((_rotMapa.value - _mapa.camera.rotation).abs() > 0.3) _rotMapa.value = _mapa.camera.rotation;
           // Límite de alejamiento: la vista no abarca más de ~45 km (lo que se lee en memoria)
           if (c.mapas.isNotEmpty) {
             final minZ = _zoomMinimoVista();
@@ -7293,6 +7528,8 @@ Future<void> dialogoRuta(BuildContext context, Controlador c) async {
 /// Toque = alternar «norte arriba» / «rumbo arriba» (el mapa gira con la brújula).
 class Brujula extends StatelessWidget {
   final ValueListenable<double?> rumbo;
+  final ValueListenable<double> rotacionMapa;
+  final VoidCallback alReiniciarNorte;
   final bool disponible;
   final bool rumboArriba;
   final VoidCallback alPulsar;
@@ -7300,6 +7537,8 @@ class Brujula extends StatelessWidget {
   const Brujula({
     super.key,
     required this.rumbo,
+    required this.rotacionMapa,
+    required this.alReiniciarNorte,
     required this.disponible,
     required this.rumboArriba,
     required this.alPulsar,
@@ -7319,25 +7558,19 @@ class Brujula extends StatelessWidget {
       color: rumboArriba ? esc.primaryContainer : esc.surface,
       child: InkWell(
         customBorder: const CircleBorder(),
-        onTap: alPulsar,
+        onTap: alReiniciarNorte, // toque = norte arriba
+        onLongPress: alPulsar, // pulsación larga = el mapa sigue la brújula del teléfono
         child: SizedBox(
           width: 80,
           height: 80,
-          child: ValueListenableBuilder<double?>(
-            valueListenable: rumbo,
-            builder: (context, h, _) {
-              if (!disponible || h == null) {
-                return Center(
-                  child: Text(
-                    disponible ? 'Brújula…' : 'Sin\nsensor',
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 11),
-                  ),
-                );
-              }
+          // El disco sigue el giro REAL del mapa (dedos, navegación o brújula): la «N» siempre señala el norte del mapa.
+          child: ValueListenableBuilder<double>(
+            valueListenable: rotacionMapa,
+            builder: (context, rot, _) {
+              final arriba = ((-rot) % 360.0 + 360.0) % 360.0; // rumbo que apunta hacia arriba de la pantalla
               return Stack(alignment: Alignment.center, children: [
                 Transform.rotate(
-                  angle: -h * math.pi / 180.0,
+                  angle: rot * math.pi / 180.0,
                   child: CustomPaint(size: const Size(80, 80), painter: _PintorDial(esc.onSurface, esc.error)),
                 ),
                 Align(
@@ -7345,8 +7578,8 @@ class Brujula extends StatelessWidget {
                   child: Icon(Icons.arrow_drop_down, color: esc.primary, size: 26),
                 ),
                 Column(mainAxisSize: MainAxisSize.min, children: [
-                  Text('${h.round()}°', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                  Text(_punto(h), style: const TextStyle(fontSize: 10)),
+                  Text('${arriba.round() % 360}°', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                  Text(_punto(arriba), style: const TextStyle(fontSize: 10)),
                 ]),
               ]);
             },
