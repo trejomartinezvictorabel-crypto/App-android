@@ -585,7 +585,14 @@ class RedVial {
         if (evitarTerraceria && cls == ClaseVia.terraceria) vel = vel / 4;
         var costo = dist[e] / (vel / 3.6);
         if (evitarPeajes && (bits & 2) != 0) costo = costo * 2 + 900;
-        if (penalizadas != null && penalizadas[e] == 1) costo *= 1.8;
+        if (penalizadas != null) {
+          final pe = penalizadas[e];
+          if (pe == 1) {
+            costo *= 1.8;
+          } else if (pe == 2) {
+            costo = costo * 30 + 600; // tramo con tráfico: casi bloqueado
+          }
+        }
         if (pu >= 0 && esCruce) costo += _penalGiro(pu, u, v, modo);
         final nuevo = g[u] + costo;
         if (nuevo < g[v]) {
@@ -1292,6 +1299,50 @@ class MotorRutas {
     }
     return Ruta(pts, acum, acum.last, seg, generarManiobras(pts, acum, calles: calles, paradas: paradas), aprox, modo,
         limiteSeg: lims, calleSeg: calles);
+  }
+
+  /// Hasta 2 desvíos desde tu posición [o] hacia [d] que evitan los ~3 km de [actual] que tienes ADELANTE
+  /// (para cuando hay tráfico o un cierre). [recorridoM] = metros que ya avanzaste de [actual].
+  Future<List<Ruta>> desviosAdelante(LatLng o, LatLng d, Modo modo, Ruta actual, double recorridoM) async {
+    final r = red;
+    if (r == null || actual.aproximada) return <Ruta>[];
+    final pen = Uint8List(r.dest.length);
+    final nodos = <int>{};
+    for (var i = 0; i < actual.puntos.length; i++) {
+      final a = actual.acum[i];
+      if (a < recorridoM + 40) continue;
+      if (a > recorridoM + 3000) break;
+      final n = r.nodoCercano(actual.puntos[i], modo, 40);
+      if (n >= 0) nodos.add(n);
+    }
+    if (nodos.isEmpty) return <Ruta>[];
+    for (final u in nodos) {
+      for (var e = r.offs[u]; e < r.offs[u + 1]; e++) {
+        if (nodos.contains(r.dest[e])) pen[e] = 2;
+      }
+    }
+    final res = <Ruta>[];
+    final previas = <Set<int>>[];
+    for (var k = 0; k < 2; k++) {
+      await Future<void>.delayed(Duration.zero);
+      final t = _tramo(o, d, modo, pen: pen);
+      if (t.aprox || t.aristas.isEmpty) break;
+      if (t.aristas.any((e) => pen[e] == 2)) break; // no hay otra forma de llegar sin pasar por ahí
+      if (t.seg > actual.duracionS * 3 + 600) break; // desvío absurdamente largo
+      final conjunto = t.aristas.toSet();
+      var repetida = false;
+      for (final q in previas) {
+        final comunes = conjunto.where(q.contains).length;
+        if (comunes / conjunto.length > 0.9) repetida = true;
+      }
+      if (repetida) break;
+      previas.add(conjunto);
+      res.add(_unir(<_Tramo>[t], modo, const <String>[]));
+      for (final e in t.aristas) {
+        if (pen[e] == 0) pen[e] = 1; // la siguiente opción debe diferir de esta
+      }
+    }
+    return res;
   }
 
   /// Hasta 2 alternativas a la última ruta calculada (solo de un tramo): penaliza las vías ya usadas y recalcula.
@@ -2246,11 +2297,30 @@ int _categoriaCapa(String n) {
     case 'street_labels':
       return 8;
     default:
+      // otros esquemas de nombres (p. ej. «roads_major», «water_polygons», «landuse_forest»…)
+      if (n.contains('water') || n.contains('lake') || n.contains('river')) {
+        return n.contains('line') || n.contains('way') ? 3 : 2;
+      }
+      if (n.contains('build')) return 4;
+      if (n.contains('road') || n.contains('transport') || n.contains('street') || n.contains('highway') || n.contains('track')) {
+        return n.contains('name') || n.contains('label') ? 8 : 5;
+      }
+      if (n.contains('bound') || n.contains('admin')) return 6;
+      if (n.contains('place') || n.contains('settlement')) return 7;
+      if (n.contains('land') || n.contains('park') || n.contains('forest') || n.contains('wood') || n.contains('green') ||
+          n.contains('nature') || n.contains('veget') || n.contains('natural')) {
+        return 1;
+      }
       return 0;
   }
 }
 
-String _claseDe(_FeatVec f) => '${f.props['class'] ?? f.props['kind'] ?? f.props['subclass'] ?? f.props['highway'] ?? ''}';
+String _claseDe(_FeatVec f) {
+  final p = f.props;
+  final v = p['class'] ?? p['kind'] ?? p['subclass'] ?? p['highway'] ?? p['fclass'] ?? p['type'] ?? p['landuse'] ??
+      p['natural'] ?? p['leisure'] ?? p['waterway'] ?? p['railway'] ?? '';
+  return '$v';
+}
 
 String _nombreDe(_FeatVec f) {
   final v = f.props['name:es'] ?? f.props['name_es'] ?? f.props['name:latin'] ?? f.props['name'];
@@ -2529,7 +2599,7 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
         if (z < 10) continue;
       } else {
         if (rango < minRango) continue;
-        if (rango == 0 && z < 15) continue;
+        if (rango == 0 && z < 14) continue;
         if (c == 'service' && z < 15) continue;
       }
       if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
@@ -2537,14 +2607,14 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
     }
   }
   final factor = math.max(0.35, math.min(4.0, math.pow(2, (z - 14) * 0.55).toDouble()));
-  const anchos = <int, double>{5: 5.0, 4: 4.5, 3: 4.0, 2: 3.5, 1: 2.8, 0: 1.3, -1: 1.2};
+  const anchos = <int, double>{5: 5.0, 4: 4.5, 3: 4.0, 2: 3.5, 1: 2.8, 0: 1.8, -1: 1.2};
   const rellenos = <int, ui.Color>{
     5: ui.Color(0xFFF5A56E),
     4: ui.Color(0xFFFBD38D),
     3: ui.Color(0xFFF8F0A8),
     2: ui.Color(0xFFFFFFFF),
     1: ui.Color(0xFFFFFFFF),
-    0: ui.Color(0xFF9C8F7A),
+    0: ui.Color(0xFF8D6E4F),
     -1: ui.Color(0xFF8A8A8A),
   };
   const bordes = <int, ui.Color>{
@@ -3803,6 +3873,62 @@ class Controlador extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// «Tráfico adelante»: calcula hasta 2 desvíos desde tu posición que evitan los próximos ~3 km de la ruta.
+  /// Devuelve la lista (vacía si no hay otro camino); el usuario elige con [usarRuta].
+  Future<List<Ruta>> calcularDesvios() async {
+    final d = destino, u = ubic, actual = ruta;
+    if (d == null || actual == null) {
+      _msg('Primero elige un destino.');
+      return <Ruta>[];
+    }
+    if (u == null) {
+      _msg('Esperando señal GPS…');
+      return <Ruta>[];
+    }
+    if (actual.aproximada || motor.red == null) {
+      _msg('Los desvíos necesitan la red vial cargada y una ruta por calles.');
+      return <Ruta>[];
+    }
+    calculando = true;
+    notifyListeners();
+    try {
+      final o = LatLng(u.latitude, u.longitude);
+      await _asegurarVentana(o, d);
+      final recorrido = fase == Fase.navegando ? (actual.total - restanteM).clamp(0.0, actual.total).toDouble() : 0.0;
+      final alt = await motor.desviosAdelante(o, d, modo, actual, recorrido);
+      if (alt.isEmpty) _msg('No encontré otro camino que evite los próximos 3 km de tu ruta.');
+      if (alt.isNotEmpty) {
+        opcionesRuta = <Ruta>[actual, ...alt]; // se dibujan en el mapa mientras eliges
+        idxRuta = 0;
+      }
+      return alt;
+    } catch (e) {
+      _msg('No se pudo calcular el desvío: $e');
+      return <Ruta>[];
+    } finally {
+      calculando = false;
+      notifyListeners();
+    }
+  }
+
+  /// Cambia a la ruta [r] (un desvío), incluso en plena navegación.
+  void usarRuta(Ruta r) {
+    opcionesRuta = <Ruta>[r];
+    idxRuta = 0;
+    _aplicarRuta(r);
+    if (fase == Fase.navegando) voz.hablar('Tomando la ruta alternativa', urgente: true);
+    notifyListeners();
+  }
+
+  /// Si cierras la hoja sin elegir, vuelven a verse solo las opciones normales.
+  void descartarDesvios() {
+    final r = ruta;
+    if (r == null) return;
+    opcionesRuta = <Ruta>[r];
+    idxRuta = 0;
+    notifyListeners();
+  }
+
   /// Rota entre la ruta principal y sus alternativas (antes de iniciar la navegación).
   void alternarRuta() {
     if (opcionesRuta.length < 2 || fase == Fase.navegando) return;
@@ -4578,6 +4704,46 @@ class Controlador extends ChangeNotifier {
   String get fuenteMapasTxt => mapasEnSd ? 'la tarjeta SD' : 'la carpeta Descargas';
   String get fuenteRedTxt => redEnSd ? 'la tarjeta SD' : 'la carpeta Descargas';
 
+  // Dónde se GUARDAN las descargas: false = carpeta Descargas, true = tarjeta SD
+  bool descargaMapaEnSd = false, descargaRedEnSd = false;
+
+  Future<void> establecerDescargaMapaEnSd(bool v) async {
+    descargaMapaEnSd = v;
+    await _guardarAjustes();
+    notifyListeners();
+  }
+
+  Future<void> establecerDescargaRedEnSd(bool v) async {
+    descargaRedEnSd = v;
+    await _guardarAjustes();
+    notifyListeners();
+  }
+
+  /// Carpeta donde guardar una descarga (Descargas o tarjeta SD). Si no hay permiso o no se puede escribir
+  /// ahí, se usa la memoria de la app ([subApp]) y se avisa. Devuelve también si quedó en una carpeta externa.
+  Future<({Directory dir, bool externa})> _carpetaDescarga(bool sd, String subApp) async {
+    if (await _pedirPermisoDescargas()) {
+      for (final ruta in sd ? await _carpetasSd() : await _carpetasDescargas()) {
+        try {
+          final d = Directory(ruta);
+          if (!await d.exists()) continue;
+          final prueba = File(ruta_p.join(ruta, '.prueba_${DateTime.now().millisecondsSinceEpoch}'));
+          await prueba.writeAsString('x');
+          await prueba.delete();
+          return (dir: d, externa: true);
+        } catch (_) {
+          continue;
+        }
+      }
+      _msg(sd
+          ? 'No pude escribir en la tarjeta SD (¿está insertada?): se guarda en la memoria de la app.'
+          : 'No pude escribir en Descargas: se guarda en la memoria de la app.');
+    } else {
+      _msg('Sin el permiso «Acceso a todos los archivos» se guarda en la memoria de la app.');
+    }
+    return (dir: await _carpeta(subApp), externa: false);
+  }
+
   Future<void> establecerMapasEnSd(bool v) async {
     mapasEnSd = v;
     await _guardarAjustes();
@@ -4718,6 +4884,58 @@ class Controlador extends ChangeNotifier {
     } else {
       _msg('No encontré archivos .mbtiles en $fuenteMapasTxt.${mapasEnSd ? ' ¿Está insertada la tarjeta?' : ''}');
     }
+  }
+
+  /// Informe general: permisos, GPS, carpetas (Descargas / tarjeta SD), mapas, red vial, índice y lugares.
+  Future<String> diagnosticoSistema() async {
+    final b = StringBuffer('=== SISTEMA ===\n');
+    Future<String> perm(Permission p) async => (await p.isGranted) ? 'sí' : 'NO';
+    b.writeln('Permiso ubicación: ${await perm(Permission.locationWhenInUse)}');
+    b.writeln('Permiso micrófono: ${await perm(Permission.microphone)}');
+    b.writeln('Permiso notificaciones: ${await perm(Permission.notification)}');
+    b.writeln('Acceso a todos los archivos: ${await perm(Permission.manageExternalStorage)}');
+    final u = ubic;
+    b.writeln(u == null
+        ? 'GPS: sin posición todavía'
+        : 'GPS: ${u.latitude.toStringAsFixed(5)}, ${u.longitude.toStringAsFixed(5)} (±${u.accuracy.round()} m)');
+    b.writeln('Voz: ${stt.estadoModelo}');
+    for (final sd in <bool>[false, true]) {
+      b.writeln('\n--- ${sd ? 'Tarjeta SD' : 'Descargas'} ---');
+      final carpetas = sd ? await _carpetasSd() : await _carpetasDescargas();
+      if (carpetas.isEmpty) b.writeln('No detecté ninguna carpeta${sd ? ' (¿hay tarjeta insertada?)' : ''}.');
+      for (final ruta in carpetas) {
+        try {
+          final existe = await Directory(ruta).exists();
+          b.writeln('$ruta: ${existe ? 'existe' : 'no existe'}');
+        } catch (e) {
+          b.writeln('$ruta: sin acceso ($e)');
+        }
+      }
+      try {
+        final mb = await _archivosExternos(sd, (p) => p.toLowerCase().endsWith('.mbtiles'));
+        final gj = await _archivosExternos(sd, (p) => p.toLowerCase().endsWith('.geojson'));
+        b.writeln('.mbtiles encontrados: ${mb.length}${mb.isEmpty ? '' : ' (${mb.map((f) => ruta_p.basename(f.path)).join(', ')})'}');
+        b.writeln('.geojson encontrados: ${gj.length}${gj.isEmpty ? '' : ' (${gj.map((f) => ruta_p.basename(f.path)).join(', ')})'}');
+      } catch (e) {
+        b.writeln('No se pudo listar: $e');
+      }
+    }
+    b.writeln('\nMapas leídos de: ${mapasEnSd ? 'tarjeta SD' : 'Descargas'} · red vial leída de: ${redEnSd ? 'tarjeta SD' : 'Descargas'}');
+    b.writeln('Descargas se guardan en: mapas ${descargaMapaEnSd ? 'SD' : 'Descargas'} · red ${descargaRedEnSd ? 'SD' : 'Descargas'}');
+    b.writeln('\n=== RED VIAL ===');
+    b.writeln(redEstado);
+    final v = _ventanaRed;
+    if (v != null) {
+      b.writeln('Zona cargada: ${v.s.toStringAsFixed(3)}, ${v.w.toStringAsFixed(3)} a ${v.n.toStringAsFixed(3)}, ${v.e.toStringAsFixed(3)}');
+    }
+    final red = motor.red;
+    if (red != null) b.writeln('Nodos en memoria: ${red.nodos} · calles con nombre: ${red.nombres.length}');
+    b.writeln('Índice de calles: ${_indicesCalles.isEmpty ? 'no hay' : '${_indicesCalles.length} archivo(s)'}'
+        '${indiceEstado.isEmpty ? '' : ' · $indiceEstado'}');
+    b.writeln('Lugares OSM guardados: $totalLugaresOsm');
+    b.writeln('\n=== MAPA ===');
+    b.write(await diagnosticoMapa());
+    return b.toString();
   }
 
   /// Informe de lo que contiene el mapa y de si se puede dibujar (para ver por qué no aparece la imagen).
@@ -5127,6 +5345,8 @@ class Controlador extends ChangeNotifier {
           evitarTerraceria = m['evitarTerraceria'] == true;
           mapasEnSd = m['mapasEnSd'] == true;
           redEnSd = m['redEnSd'] == true;
+          descargaMapaEnSd = m['descargaMapaEnSd'] == true;
+          descargaRedEnSd = m['descargaRedEnSd'] == true;
           motor.evitarPeajes = evitarPeajes;
           motor.evitarTerraceria = evitarTerraceria;
         }
@@ -5142,6 +5362,8 @@ class Controlador extends ChangeNotifier {
         'evitarTerraceria': evitarTerraceria,
         'mapasEnSd': mapasEnSd,
         'redEnSd': redEnSd,
+        'descargaMapaEnSd': descargaMapaEnSd,
+        'descargaRedEnSd': descargaRedEnSd,
       }));
     } catch (_) {}
   }
@@ -5207,7 +5429,8 @@ class Controlador extends ChangeNotifier {
     if (alcance != Alcance.pais && estado == null) return _msg('Elige un estado.');
     if (alcance == Alcance.municipio && municipio == null) return _msg('Busca y elige un municipio.');
     final det = alcance == Alcance.pais ? Detalle.troncal : detalle;
-    final dir = await _carpeta('red');
+    final carpetaDestino = await _carpetaDescarga(descargaRedEnSd, 'red');
+    final dir = carpetaDestino.dir;
     late final String nombreArchivo;
     if (alcance == Alcance.pais) {
       nombreArchivo = 'red_mexico.geojson';
@@ -5248,6 +5471,10 @@ class Controlador extends ChangeNotifier {
         cancelado: () => _cancelarDescarga,
       );
       await parcial.rename(destinoArchivo.path);
+      if (carpetaDestino.externa) {
+        redEnSd = descargaRedEnSd; // el lector pasa a leer de donde se guardó el archivo
+        await _guardarAjustes();
+      }
       _progresoDescarga(1, 'Cargando la red vial en memoria…');
       await _cargarRedGuardada();
       _msg('Red vial de $lugar lista ($vias vías).');
@@ -5315,7 +5542,8 @@ class Controlador extends ChangeNotifier {
           'Mantén la app abierta; la pantalla no se apagará.');
       if (!ok) return;
 
-      final dir = await _carpeta('mapas');
+      final carpetaDestino = await _carpetaDescarga(descargaMapaEnSd, 'mapas');
+      final dir = carpetaDestino.dir;
       final nombre = 'mapa_${_slug(zona.nombre)}_z$zMin-$zMax.mbtiles';
       final parcial = File(ruta_p.join(dir.path, '$nombre.part'));
       final destinoArchivo = File(ruta_p.join(dir.path, nombre));
@@ -5331,6 +5559,10 @@ class Controlador extends ChangeNotifier {
         );
         if (await destinoArchivo.exists()) await destinoArchivo.delete();
         await parcial.rename(destinoArchivo.path);
+        if (carpetaDestino.externa) {
+          mapasEnSd = descargaMapaEnSd; // el lector pasa a leer de donde se guardó el archivo
+          await _guardarAjustes();
+        }
         _msg('Mapa de ${zona.nombre} listo ($n teselas).');
       } finally {
         await _borrarSilencioso(parcial);
@@ -5400,6 +5632,40 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
   Ruta? _rutaVista;
   Fase _faseVista = Fase.inactiva;
   Timer? _tFoco;
+
+  /// Botón «Tráfico adelante»: calcula 2 desvíos desde tu posición y deja elegir uno.
+  Future<void> _desviosTrafico() async {
+    final alt = await c.calcularDesvios();
+    if (!mounted || alt.isEmpty) return;
+    final elegida = await showModalBottomSheet<Ruta>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const ListTile(
+            title: Text('Desvíos que evitan el tráfico de adelante', style: TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text('Se ven en el mapa en gris; la ruta actual sigue en azul.'),
+          ),
+          for (var i = 0; i < alt.length; i++)
+            ListTile(
+              leading: const Icon(Icons.alt_route),
+              title: Text('Desvío ${i + 1}'),
+              subtitle: Text('${Fmt.dist(alt[i].total)} · ${Fmt.dur(alt[i].duracionS.round())}'),
+              onTap: () => Navigator.pop(ctx, alt[i]),
+            ),
+          ListTile(
+            leading: const Icon(Icons.close),
+            title: const Text('Seguir por la ruta actual'),
+            onTap: () => Navigator.pop(ctx),
+          ),
+        ]),
+      ),
+    );
+    if (elegida != null) {
+      c.usarRuta(elegida);
+    } else {
+      c.descartarDesvios();
+    }
+  }
 
   /// Zoom mínimo para que el ancho de la pantalla no abarque más de 45 km (a la latitud actual del mapa).
   double _zoomMinimoVista() {
@@ -5631,7 +5897,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
           PolylineLayer(polylines: [Polyline(points: c.trazaVista, strokeWidth: 4, color: Colors.purple.shade600)]),
         if (c.grabando && c.trazaGrabada.length >= 2)
           PolylineLayer(polylines: [Polyline(points: c.trazaGrabada, strokeWidth: 4, color: Colors.red.shade600)]),
-        if (c.opcionesRuta.length > 1 && c.fase != Fase.navegando)
+        if (c.opcionesRuta.length > 1)
           PolylineLayer(polylines: [
             for (var i = 0; i < c.opcionesRuta.length; i++)
               if (i != c.idxRuta)
@@ -5882,6 +6148,15 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                           '${Fmt.dist(c.ruta?.total ?? 0)} · ${Fmt.dur((c.ruta?.duracionS ?? 0).round())} (cambiar)'),
                     ),
                   ),
+                if (c.ruta != null && !c.ruta!.aproximada)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: c.calculando ? null : _desviosTrafico,
+                      icon: const Icon(Icons.warning_amber_rounded),
+                      label: const Text('🚧 Tráfico adelante: ver 2 desvíos'),
+                    ),
+                  ),
                 if (c.calculando) const Padding(padding: EdgeInsets.only(top: 6), child: LinearProgressIndicator()),
                 const SizedBox(height: 6),
                 Row(children: [
@@ -6090,6 +6365,31 @@ class PantallaMenu extends StatelessWidget {
         subtitle: const Text('Caminos de tierra solo si no hay otra opción'),
         value: c.evitarTerraceria,
         onChanged: c.establecerEvitarTerraceria,
+      ),
+      const Divider(),
+      const Text('Diagnóstico', style: TextStyle(fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      FilledButton.tonalIcon(
+        icon: const Icon(Icons.bug_report_outlined),
+        label: const Text('Diagnóstico del sistema'),
+        onPressed: () async {
+          final texto = await c.diagnosticoSistema();
+          if (!ctx.mounted) return;
+          await showDialog<void>(
+            context: ctx,
+            builder: (d) => AlertDialog(
+              title: const Text('Diagnóstico del sistema'),
+              content: SingleChildScrollView(child: SelectableText(texto, style: const TextStyle(fontSize: 12))),
+              actions: [
+                TextButton(
+                  onPressed: () => Clipboard.setData(ClipboardData(text: texto)),
+                  child: const Text('Copiar'),
+                ),
+                TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cerrar')),
+              ],
+            ),
+          );
+        },
       ),
       const Divider(),
       const Text('Herramientas de campo', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -6319,6 +6619,16 @@ class _EstadoPanelDescarga extends State<PanelDescarga> {
         return Padding(
         padding: const EdgeInsets.only(bottom: 12),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          if (!widget.esLugares)
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Guardar en la tarjeta SD'),
+              subtitle: Text((widget.esMapa ? c.descargaMapaEnSd : c.descargaRedEnSd)
+                  ? 'Se guardará en la tarjeta microSD'
+                  : 'Se guardará en la carpeta Descargas'),
+              value: widget.esMapa ? c.descargaMapaEnSd : c.descargaRedEnSd,
+              onChanged: ocupado ? null : (widget.esMapa ? c.establecerDescargaMapaEnSd : c.establecerDescargaRedEnSd),
+            ),
           const Text('¿Qué zona necesitas?'),
           const SizedBox(height: 8),
           SegmentedButton<Alcance>(
