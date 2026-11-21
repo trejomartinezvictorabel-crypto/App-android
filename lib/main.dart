@@ -2798,7 +2798,7 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
   static Future<ui.Image?> _enCola(Future<ui.Image?> Function() trabajo) {
     final fin = Completer<ui.Image?>();
     _pendientes.add((trabajo: trabajo, fin: fin));
-    while (_pendientes.length > 60) {
+    while (_pendientes.length > 400) {
       _pendientes.removeAt(0).fin.completeError(const _TeselaDescartada());
     }
     _arrancarCola();
@@ -2905,6 +2905,7 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
       // Un fallo se ve en pantalla como una tesela rosada y queda anotado en el diagnóstico
       fallidas++;
       ultimoError = '$e\n${st.toString().split('\n').take(4).join('\n')}';
+      Registro.anotar('Mapa: no se pudo dibujar la tesela $z/$x/$y: $e', aviso: fallidas == 1);
       final rec = ui.PictureRecorder();
       ui.Canvas(rec).drawRect(const ui.Rect.fromLTWH(0, 0, 256, 256), ui.Paint()..color = const ui.Color(0xFFFFD6D6));
       return ImageInfo(image: await rec.endRecording().toImage(256, 256));
@@ -3610,11 +3611,14 @@ class Controlador extends ChangeNotifier {
   double? _rumboSuave;
 
   void _msg(String t) {
+    Registro.anotar(t);
     mensaje = t;
     notifyListeners();
   }
 
   Future<void> iniciar() async {
+    Registro.alAviso = (t) => _msg('⚠ $t');
+    Registro.anotar('Inicio de la app');
     voz.alError = _msg;
     await datos.abrir();
     await _leerAjustesDescarga();
@@ -4886,10 +4890,28 @@ class Controlador extends ChangeNotifier {
     }
   }
 
+  /// Guarda el informe como diagnostico_navegacion.txt en Descargas (o en la memoria de la app).
+  Future<void> guardarDiagnostico(String texto) async {
+    try {
+      final d = await _carpetaDescarga(false, 'recorridos');
+      final f = File(ruta_p.join(d.dir.path, 'diagnostico_navegacion.txt'));
+      await f.writeAsString(texto);
+      _msg('Informe guardado en ${f.path}');
+    } catch (e) {
+      _msg('No se pudo guardar el informe: $e');
+    }
+  }
+
   /// Informe general: permisos, GPS, carpetas (Descargas / tarjeta SD), mapas, red vial, índice y lugares.
   Future<String> diagnosticoSistema() async {
     final b = StringBuffer('=== SISTEMA ===\n');
-    Future<String> perm(Permission p) async => (await p.isGranted) ? 'sí' : 'NO';
+    Future<String> perm(Permission p) async {
+      try {
+        return (await p.isGranted) ? 'sí' : 'NO';
+      } catch (e) {
+        return 'error ($e)';
+      }
+    }
     b.writeln('Permiso ubicación: ${await perm(Permission.locationWhenInUse)}');
     b.writeln('Permiso micrófono: ${await perm(Permission.microphone)}');
     b.writeln('Permiso notificaciones: ${await perm(Permission.notification)}');
@@ -4901,7 +4923,12 @@ class Controlador extends ChangeNotifier {
     b.writeln('Voz: ${stt.estadoModelo}');
     for (final sd in <bool>[false, true]) {
       b.writeln('\n--- ${sd ? 'Tarjeta SD' : 'Descargas'} ---');
-      final carpetas = sd ? await _carpetasSd() : await _carpetasDescargas();
+      List<String> carpetas = <String>[];
+      try {
+        carpetas = sd ? await _carpetasSd() : await _carpetasDescargas();
+      } catch (e) {
+        b.writeln('Error al buscar carpetas: $e');
+      }
       if (carpetas.isEmpty) b.writeln('No detecté ninguna carpeta${sd ? ' (¿hay tarjeta insertada?)' : ''}.');
       for (final ruta in carpetas) {
         try {
@@ -4934,7 +4961,11 @@ class Controlador extends ChangeNotifier {
         '${indiceEstado.isEmpty ? '' : ' · $indiceEstado'}');
     b.writeln('Lugares OSM guardados: $totalLugaresOsm');
     b.writeln('\n=== MAPA ===');
-    b.write(await diagnosticoMapa());
+    try {
+      b.write(await diagnosticoMapa());
+    } catch (e) {
+      b.writeln('Error al revisar el mapa: $e');
+    }
     return b.toString();
   }
 
@@ -5592,8 +5623,39 @@ class Controlador extends ChangeNotifier {
 // 9. INTERFAZ (Material 3)
 // ============================================================================
 
+/// Registro de eventos y errores de la app: se ve en pantalla (Diagnóstico) y se puede copiar o guardar.
+class Registro {
+  static final List<String> _lineas = <String>[];
+  static void Function(String)? alAviso; // muestra un aviso en pantalla
+  static int _ultimoAvisoMs = 0;
+
+  static void anotar(String t, {bool aviso = false}) {
+    final n = DateTime.now();
+    String d2(int v) => v.toString().padLeft(2, '0');
+    _lineas.add('[${d2(n.hour)}:${d2(n.minute)}:${d2(n.second)}] $t');
+    if (_lineas.length > 400) _lineas.removeRange(0, _lineas.length - 400);
+    final ms = n.millisecondsSinceEpoch;
+    if (aviso && alAviso != null && ms - _ultimoAvisoMs > 3000) {
+      _ultimoAvisoMs = ms;
+      alAviso!(t.length > 180 ? '${t.substring(0, 180)}…' : t);
+    }
+  }
+
+  static String texto() => _lineas.isEmpty ? '(sin eventos todavía)' : _lineas.join('\n');
+}
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Todo error no atrapado queda en el registro y sale como aviso en pantalla
+  final presentar = FlutterError.presentError;
+  FlutterError.onError = (d) {
+    Registro.anotar('ERROR de Flutter: ${d.exceptionAsString()}', aviso: true);
+    presentar(d);
+  };
+  ui.PlatformDispatcher.instance.onError = (e, st) {
+    Registro.anotar('ERROR: $e\n${st.toString().split('\n').take(4).join('\n')}', aviso: true);
+    return true;
+  };
   // Vertical fija: la brújula del sensor está calibrada para el teléfono en vertical
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   final c = Controlador();
@@ -5613,6 +5675,90 @@ class AppNavegacion extends StatelessWidget {
         darkTheme: ThemeData(
             useMaterial3: true, colorSchemeSeed: const Color(0xFF1565C0), brightness: Brightness.dark),
         home: PantallaPrincipal(c),
+      );
+}
+
+/// Pantalla de diagnóstico: informe de todo el sistema + registro de eventos. Se puede copiar o guardar.
+class PantallaDiagnostico extends StatefulWidget {
+  final Controlador c;
+  const PantallaDiagnostico(this.c, {super.key});
+
+  @override
+  State<PantallaDiagnostico> createState() => _EstadoDiagnostico();
+}
+
+class _EstadoDiagnostico extends State<PantallaDiagnostico> {
+  String _texto = '';
+  bool _cargando = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _generar();
+  }
+
+  Future<void> _generar() async {
+    setState(() => _cargando = true);
+    String t;
+    try {
+      t = await widget.c.diagnosticoSistema().timeout(const Duration(seconds: 40));
+    } catch (e) {
+      t = 'No se pudo generar el informe completo: $e';
+    }
+    t = '$t\n\n=== REGISTRO DE EVENTOS Y ERRORES (lo más reciente al final) ===\n${Registro.texto()}';
+    if (!mounted) return;
+    setState(() {
+      _texto = t;
+      _cargando = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: const Text('Diagnóstico'),
+          actions: [IconButton(onPressed: _cargando ? null : _generar, icon: const Icon(Icons.refresh), tooltip: 'Actualizar')],
+        ),
+        body: _cargando
+            ? const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 12),
+                Text('Revisando la aplicación…'),
+              ]))
+            : Column(children: [
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(12),
+                    child: SelectableText(_texto, style: const TextStyle(fontSize: 12)),
+                  ),
+                ),
+                SafeArea(
+                  top: false,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                    child: Row(children: [
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: () async {
+                            await Clipboard.setData(ClipboardData(text: _texto));
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Informe copiado')));
+                            }
+                          },
+                          child: const Text('Copiar'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => widget.c.guardarDiagnostico(_texto),
+                          child: const Text('Guardar en Descargas'),
+                        ),
+                      ),
+                    ]),
+                  ),
+                ),
+              ]),
       );
 }
 
@@ -5748,7 +5894,11 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
       c.mensaje = null;
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(m)));
+        ..showSnackBar(SnackBar(
+          content: Text(m),
+          duration: Duration(seconds: m.length > 70 || m.startsWith('⚠') ? 9 : 4),
+          showCloseIcon: true,
+        ));
     }
     final u = c.ubic;
     if (_listo && u == null && !_centrado && !_ajustadoAlMapa && c.limitesMapa != null) {
@@ -6188,6 +6338,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                 _menu(c.grabando ? '⏹ Detener GPX' : '⏺ Grabar GPX', () => c.grabando ? c.detenerGrabacion() : c.iniciarGrabacion()),
                 _menu('🥾 Recorridos', () => _abrirMenu(3)),
                 _menu('📋 Coordenadas', c.copiarCoordenadas),
+                _menu('🩺 Diagnóstico', () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => PantallaDiagnostico(c)))),
               ]),
             ],
           ]),
@@ -6372,24 +6523,7 @@ class PantallaMenu extends StatelessWidget {
       FilledButton.tonalIcon(
         icon: const Icon(Icons.bug_report_outlined),
         label: const Text('Diagnóstico del sistema'),
-        onPressed: () async {
-          final texto = await c.diagnosticoSistema();
-          if (!ctx.mounted) return;
-          await showDialog<void>(
-            context: ctx,
-            builder: (d) => AlertDialog(
-              title: const Text('Diagnóstico del sistema'),
-              content: SingleChildScrollView(child: SelectableText(texto, style: const TextStyle(fontSize: 12))),
-              actions: [
-                TextButton(
-                  onPressed: () => Clipboard.setData(ClipboardData(text: texto)),
-                  child: const Text('Copiar'),
-                ),
-                TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cerrar')),
-              ],
-            ),
-          );
-        },
+        onPressed: () => Navigator.of(ctx).push(MaterialPageRoute<void>(builder: (_) => PantallaDiagnostico(c))),
       ),
       const Divider(),
       const Text('Herramientas de campo', style: TextStyle(fontWeight: FontWeight.bold)),
