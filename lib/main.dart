@@ -485,7 +485,40 @@ List<Maniobra> generarManiobras(List<LatLng> pts, List<double> acum,
 /// Grafo en formato CSR con arreglos tipados (poca memoria en equipos de 4 GB).
 /// Por arista: [clase] tipo de vía, [contra] bits (1 = contra sentido, 2 = peaje),
 /// [velMax] límite de velocidad en km/h (0 = desconocido) y [nombreE] id del nombre de la calle (-1 = sin nombre).
+/// Negocio / establecimiento leído del GeoJSON de la red (puntos con nombre y etiqueta amenity/shop/tourism…).
+class LugarRed {
+  final String nombre, norm, icono;
+  final double lat, lon;
+  const LugarRed(this.nombre, this.norm, this.icono, this.lat, this.lon);
+}
+
+/// Emoji del negocio según sus etiquetas de OSM; null si el punto no es un negocio/establecimiento.
+String? _iconoLugarOsm(Map props) {
+  final a = props['amenity']?.toString();
+  if (a != null) {
+    switch (a) {
+      case 'fuel': return '⛽';
+      case 'pharmacy': return '💊';
+      case 'hospital': case 'clinic': case 'doctors': case 'dentist': return '🏥';
+      case 'restaurant': case 'fast_food': case 'cafe': case 'bar': case 'pub': case 'food_court': case 'ice_cream': return '🍽️';
+      case 'bank': case 'atm': return '🏧';
+      case 'school': case 'university': case 'college': case 'kindergarten': return '🏫';
+      case 'place_of_worship': return '⛪';
+      case 'police': case 'fire_station': return '🚓';
+      case 'parking': case 'bench': case 'waste_basket': case 'toilets': case 'drinking_water': case 'recycling': return null;
+      default: return '📍';
+    }
+  }
+  final sh = props['shop']?.toString();
+  if (sh != null) return (sh == 'car_repair' || sh == 'tyres') ? '🔧' : '🛒';
+  final t = props['tourism']?.toString();
+  if (t != null) return (t == 'hotel' || t == 'motel' || t == 'hostel' || t == 'guest_house') ? '🏨' : '📍';
+  if (props['office'] != null || props['craft'] != null || props['healthcare'] != null || props['leisure'] != null) return '📍';
+  return null;
+}
+
 class RedVial {
+  final List<LugarRed> lugares; // negocios de la zona cargada
   final Float64List lats, lons;
   final Int32List offs, dest;
   final Float32List dist;
@@ -500,6 +533,7 @@ class RedVial {
   final Int32List celdaOffs, celdaNodos;
 
   RedVial({
+    this.lugares = const <LugarRed>[],
     required this.lats,
     required this.lons,
     required this.offs,
@@ -1091,6 +1125,7 @@ Future<RedVial> construirRed(List<String> rutas, [Ventana? ventana]) async {
   final idsNombre = <String, int>{};
   final nombres = <String>[];
   final reps = <int, List<int>>{};
+  final lugares = <LugarRed>[];
   // Con más de 400 MB de GeoJSON se omiten senderos, ciclovías y vías de servicio para que quepa en memoria
   var bytesTotal = 0;
   for (final r in rutas) {
@@ -1134,6 +1169,16 @@ Future<RedVial> construirRed(List<String> rutas, [Ventana? ventana]) async {
     final props = f['properties'];
     final geom = f['geometry'];
     if (props is! Map || geom is! Map) return;
+    if (geom['type'] == 'Point') {
+      // Negocio o establecimiento (punto con nombre)
+      final co = geom['coordinates'];
+      final nom = (props['name'] ?? props['brand'] ?? props['operator'])?.toString().trim() ?? '';
+      final ico = _iconoLugarOsm(props);
+      if (co is List && co.length >= 2 && co[0] is num && co[1] is num && ico != null && nom.isNotEmpty && lugares.length < 80000) {
+        lugares.add(LugarRed(nom, Fmt.normalizar(nom), ico, (co[1] as num).toDouble(), (co[0] as num).toDouble()));
+      }
+      return;
+    }
     final claseVia = claseDesdeOsm(props['highway']?.toString());
     if (claseVia == null) return;
     if (ligera && (claseVia == ClaseVia.peatonal || claseVia == ClaseVia.ciclovia || claseVia == ClaseVia.servicio)) return;
@@ -1188,7 +1233,7 @@ Future<RedVial> construirRed(List<String> rutas, [Ventana? ventana]) async {
     if (tam > 20 * 1024 * 1024 && await _esGeoJsonPorLineas(archivo) == false) {
       // GeoJSON grande hecho por otra herramienta: se lee en flujo, objeto por objeto
       await for (final t in _featuresGeoJson(archivo)) {
-        if (!t.contains('"highway"')) continue; // edificios, límites, etc. no sirven para rutas
+        if (!t.contains('"highway"') && !t.contains('"Point"')) continue; // edificios, límites, etc. no sirven para rutas
         if (ventana != null && !_tocaVentana(t, ventana)) continue; // vía fuera de la zona cargada
         try {
           procesar(jsonDecode(t));
@@ -1293,6 +1338,7 @@ Future<RedVial> construirRed(List<String> rutas, [Ventana? ventana]) async {
   }
 
   return RedVial(
+    lugares: lugares,
     lats: latsT,
     lons: lonsT,
     offs: offs,
@@ -2807,6 +2853,7 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
     for (final f in capa.feats) {
       if (f.tipo == 1) continue;
       if (f.tipo == 2 && _esClaseVia(_claseDe(f))) continue; // ya pintada como calle
+      if (f.tipo == 2 && z < 13) continue; // alejado: las líneas sin clasificar solo hacen ruido
       if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
       _agregarTrazos(f.tipo == 3 ? genPol : genLin, f, k, ox, oy, cerrar: f.tipo == 3);
     }
@@ -2822,8 +2869,8 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
   final ocupados = <ui.Rect>[];
   final halo = ui.Paint()
     ..style = ui.PaintingStyle.stroke
-    ..strokeWidth = 4
-    ..color = const ui.Color(0xCCFFFFFF);
+    ..strokeWidth = 5
+    ..color = const ui.Color(0xE6FFFFFF);
   const colTexto = ui.Color(0xFF333333);
 
   bool libre(ui.Rect r) {
@@ -2861,6 +2908,33 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
     canvas.drawParagraph(texto, ui.Offset(l.x - 150, l.y - texto.height / 2));
   }
 
+  // Negocios / puntos con nombre de cualquier capa (que no sea la de poblados): punto + nombre
+  if (z >= 15) {
+    var n = 0;
+    for (final capa in capas) {
+      final cat = _categoriaCapa(capa.nombre);
+      if (cat == 7) continue;
+      final k = kDe(capa);
+      for (final f in capa.feats) {
+        if (f.tipo != 1 || f.partes.isEmpty || n >= 80) continue;
+        final nombre = _nombreDe(f);
+        if (nombre.isEmpty) continue;
+        final px = f.partes.first[0] * k - ox, py = f.partes.first[1] * k - oy;
+        if (px < 0 || px > _pxTesela || py < 0 || py > _pxTesela) continue;
+        final texto = _parrafo(nombre, 22, color: const ui.Color(0xFF4A2A00), negrita: true);
+        final caja = ui.Rect.fromLTWH(px - 7, py - 12, texto.longestLine + 22, math.max(texto.height, 24));
+        if (!libre(caja)) continue;
+        ocupados.add(caja);
+        n++;
+        canvas.drawCircle(ui.Offset(px, py), 8, ui.Paint()..color = const ui.Color(0xFFFFFFFF));
+        canvas.drawCircle(ui.Offset(px, py), 6, ui.Paint()..color = const ui.Color(0xFFE65100));
+        final fondo = _parrafo(nombre, 22, contorno: halo, negrita: true);
+        canvas.drawParagraph(fondo, ui.Offset(px + 10 - 150 + texto.longestLine / 2, py - fondo.height / 2));
+        canvas.drawParagraph(texto, ui.Offset(px + 10 - 150 + texto.longestLine / 2, py - texto.height / 2));
+      }
+    }
+  }
+
   if (z >= 13) {
     final usados = <String, int>{};
     for (final capa in capas) {
@@ -2883,7 +2957,7 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
         for (var i = 1; i < n; i++) {
           largo += math.sqrt(math.pow(mejor[2 * i] - mejor[2 * i - 2], 2) + math.pow(mejor[2 * i + 1] - mejor[2 * i - 1], 2)) * k;
         }
-        final texto = _parrafo(nombre, 18, color: const ui.Color(0xFF555555));
+        final texto = _parrafo(nombre, 24, color: const ui.Color(0xFF1A1A1A), negrita: true);
         if (largo < texto.longestLine * 1.15) continue;
         var acum = 0.0;
         var mx = 0.0, my = 0.0, ang = 0.0;
@@ -2908,7 +2982,7 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
         if (!libre(caja)) continue;
         ocupados.add(caja);
         usados[nombre] = (usados[nombre] ?? 0) + 1;
-        final fondo = _parrafo(nombre, 18, contorno: halo);
+        final fondo = _parrafo(nombre, 24, contorno: halo, negrita: true);
         canvas.save();
         canvas.translate(mx, my);
         canvas.rotate(ang);
@@ -4392,6 +4466,21 @@ class Controlador extends ChangeNotifier {
           if (vistos.length >= 8) break;
         }
         if (vistos.isNotEmpty) break;
+      }
+    }
+    // Negocios y establecimientos de la red (zona cargada)
+    if (red != null && red.lugares.isNotEmpty && norm.length >= 3) {
+      final hallados = <LugarRed>[];
+      for (final l in red.lugares) {
+        if (l.norm.contains(norm)) hallados.add(l);
+        if (hallados.length >= 3000) break;
+      }
+      if (u != null) {
+        hallados.sort((a, b) => Geo.dist(u.latitude, u.longitude, a.lat, a.lon)
+            .compareTo(Geo.dist(u.latitude, u.longitude, b.lat, b.lon)));
+      }
+      for (final l in hallados.take(25)) {
+        res.add(Resultado(l.nombre, 'Negocio${aDist(l.lat, l.lon)}', l.icono, l.lat, l.lon));
       }
     }
     final vistasCalle = <String>{};
@@ -6260,6 +6349,35 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
 
   bool _avisoMostrado = false;
 
+  // Negocios de la red vial visibles en pantalla (solo con mucho zoom, para no saturar)
+  List<LugarRed> _poisVista = const <LugarRed>[];
+  Timer? _tPoi;
+
+  void _actualizarPoisVista() {
+    _tPoi?.cancel();
+    _tPoi = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted || !_listo) return;
+      final red = c.motor.red;
+      List<LugarRed> nuevos = const <LugarRed>[];
+      if (red != null && red.lugares.isNotEmpty && _mapa.camera.zoom >= 16) {
+        try {
+          final b = _mapa.camera.visibleBounds;
+          final l = <LugarRed>[];
+          for (final x in red.lugares) {
+            if (x.lat >= b.south && x.lat <= b.north && x.lon >= b.west && x.lon <= b.east) {
+              l.add(x);
+              if (l.length >= 80) break;
+            }
+          }
+          nuevos = l;
+        } catch (_) {}
+      }
+      if (nuevos.length != _poisVista.length || (nuevos.isNotEmpty && !identical(nuevos.first, _poisVista.first))) {
+        setState(() => _poisVista = nuevos);
+      }
+    });
+  }
+
   /// Espera a que se lean los ajustes y, si nunca aceptaste el aviso, lo muestra antes de pedir permisos.
   Future<void> _revisarPrivacidad() async {
     for (var i = 0; i < 40 && mounted && !_avisoMostrado; i++) {
@@ -6276,6 +6394,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
   @override
   void dispose() {
     _tFoco?.cancel();
+    _tPoi?.cancel();
     _rotMapa.dispose();
     c.removeListener(_alCambiar);
     c.brujula.removeListener(_alBrujula);
@@ -6531,6 +6650,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         onPositionChanged: (pos, hayGesto) {
           if (hayGesto && _seguir) setState(() => _seguir = false); // el usuario movió el mapa
           if (!_listo) return;
+          _actualizarPoisVista();
           if ((_rotMapa.value - _mapa.camera.rotation).abs() > 0.3) _rotMapa.value = _mapa.camera.rotation;
           // Límite de alejamiento: la vista no abarca más de ~45 km (lo que se lee en memoria)
           if (c.mapas.isNotEmpty) {
@@ -6572,6 +6692,26 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
         if (r != null)
           PolylineLayer(polylines: [Polyline(points: r.puntos, strokeWidth: 6, color: Colors.blue.shade700)]),
         MarkerLayer(rotate: true, markers: [ // rotate: los pines no se giran con el mapa
+          for (final l in _poisVista)
+            Marker(
+              point: LatLng(l.lat, l.lon),
+              width: 130,
+              height: 48,
+              child: GestureDetector(
+                onTap: () => c.irAResultado(Resultado(l.nombre, 'Negocio', l.icono, l.lat, l.lon)),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text(l.icono, style: const TextStyle(fontSize: 20)),
+                  Text(l.nombre,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w800,
+                          color: Color(0xFF3E2200),
+                          shadows: [Shadow(color: Colors.white, blurRadius: 3), Shadow(color: Colors.white, blurRadius: 3)])),
+                ]),
+              ),
+            ),
           for (final p in c.pois)
             Marker(
               point: LatLng(p.lat, p.lon),
