@@ -2463,6 +2463,18 @@ String _claseDe(_FeatVec f) {
   return '$v';
 }
 
+/// ¿La clase es un tipo de vía conocido (highway de OSM u otro esquema)? Sirve para pintar como calles
+/// las líneas de capas con nombre desconocido (p. ej. «Navegacion»).
+bool _esClaseVia(String c) {
+  const v = {
+    'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'residential', 'unclassified', 'service',
+    'living_street', 'track', 'path', 'footway', 'cycleway', 'pedestrian', 'steps', 'road', 'street',
+    'motorway_link', 'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link', 'minor', 'major',
+    'local', 'bridleway',
+  };
+  return v.contains(c.toLowerCase());
+}
+
 String _nombreDe(_FeatVec f) {
   final v = f.props['name:es'] ?? f.props['name_es'] ?? f.props['name:latin'] ?? f.props['name'];
   return v == null ? '' : '$v';
@@ -2729,11 +2741,13 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
   final porRango = <int, ui.Path>{};
   final minRango = z < 6 ? 5 : (z < 9 ? 4 : (z < 11 ? 3 : (z < 13 ? 2 : (z < 14 ? 1 : 0))));
   for (final capa in capas) {
-    if (_categoriaCapa(capa.nombre) != 5) continue;
+    final catV = _categoriaCapa(capa.nombre);
+    if (catV != 5 && catV != 0) continue;
     final k = kDe(capa);
     for (final f in capa.feats) {
       if (f.tipo != 2) continue;
       final c = _claseDe(f);
+      if (catV == 0 && !_esClaseVia(c)) continue; // capa desconocida: solo lo que parece calle
       final rango = _rangoVia(c);
       if (rango == -9) continue;
       if (rango == -1) {
@@ -2792,6 +2806,7 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
     final k = kDe(capa);
     for (final f in capa.feats) {
       if (f.tipo == 1) continue;
+      if (f.tipo == 2 && _esClaseVia(_claseDe(f))) continue; // ya pintada como calle
       if (recortar && _fueraDeImagen(f, k, ox, oy)) continue;
       _agregarTrazos(f.tipo == 3 ? genPol : genLin, f, k, ox, oy, cerrar: f.tipo == 3);
     }
@@ -2846,16 +2861,17 @@ Future<ui.Image> _dibujarVectorial(List<_CapaVec> capas, int zDatos, int d, int 
     canvas.drawParagraph(texto, ui.Offset(l.x - 150, l.y - texto.height / 2));
   }
 
-  if (z >= 15) {
+  if (z >= 13) {
     final usados = <String, int>{};
     for (final capa in capas) {
       final cat = _categoriaCapa(capa.nombre);
-      if (cat != 8 && cat != 5) continue;
+      if (cat != 8 && cat != 5 && cat != 0) continue;
       final k = kDe(capa);
       for (final f in capa.feats) {
         if (f.tipo != 2 || f.partes.isEmpty) continue;
         final nombre = _nombreDe(f);
         if (nombre.isEmpty || (usados[nombre] ?? 0) >= 2) continue;
+        if (z < 15 && _rangoVia(_claseDe(f)) < 2) continue; // con poco zoom solo las calles principales
         // parte más larga y su punto medio
         Float32List? mejor;
         for (final p in f.partes) {
@@ -2990,7 +3006,7 @@ class _ImagenMbTile extends ImageProvider<_ImagenMbTile> {
   Future<ui.Image?> _vectorialDe(int i) async {
     final zb = zMaxBase[i];
     final d = z > zb ? z - zb : 0;
-    if (d > 6) return null;
+    if (d > 8) return null;
     final zd = z - d;
     final xd = x >> d, yd = y >> d;
     final sx = x & ((1 << d) - 1), sy = y & ((1 << d) - 1);
@@ -3757,12 +3773,26 @@ class Controlador extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ---- Privacidad: aviso previo (divulgación destacada que exige Google Play) ----
+  bool privacidadAceptada = false;
+  bool ajustesLeidos = false;
+  final Completer<void> _consentimiento = Completer<void>();
+
+  Future<void> aceptarPrivacidad() async {
+    privacidadAceptada = true;
+    await _guardarAjustes();
+    if (!_consentimiento.isCompleted) _consentimiento.complete();
+    notifyListeners();
+  }
+
   Future<void> iniciar() async {
     Registro.alAviso = (t) => _msg('⚠ $t');
     Registro.anotar('Inicio de la app');
     voz.alError = _msg;
     await datos.abrir();
     await _leerAjustesDescarga();
+    ajustesLeidos = true;
+    if (privacidadAceptada && !_consentimiento.isCompleted) _consentimiento.complete();
     await contarLugares();
     unawaited(_repararRecorridos());
     await _recargar();
@@ -3770,6 +3800,7 @@ class Controlador extends ChangeNotifier {
     unawaited(stt.cargarModelo().then((_) => notifyListeners())); // modelo de voz en segundo plano
     await _abrirMapas();
     unawaited(_cargarRedGuardada()); // un archivo grande tarda: no bloquea el GPS ni los permisos
+    await _consentimiento.future; // ningún permiso se pide antes de que aceptes el aviso de privacidad
     await iniciarGps(); // ubicación (diálogo del sistema)
     _iniciarBrujula();
     await pedirPermisos();
@@ -4307,23 +4338,60 @@ class Controlador extends ChangeNotifier {
     }
     final red = motor.red;
     // «Calle A y calle B», «esquina de A con B», «cruce de A y B»: busca la intersección
-    var buscoCruce = false, hayCruce = false;
-    if (red != null) {
+    var hayCruce = false;
+    final divisiones = <(String, String)>[];
+    {
       var t = norm.replaceFirst(RegExp(r'^(esquina|cruce|interseccion|esq\.?)\s+(de\s+|con\s+|entre\s+)?'), '');
       t = t.replaceFirst(RegExp(r'^entre\s+'), '');
       final tk = t.split(RegExp(r'\s+'));
       for (var k = 1; k < tk.length - 1; k++) {
-        if (!const {'y', 'e', 'con', '&', 'x'}.contains(tk[k])) continue;
-        buscoCruce = true;
-        final ca = tk.sublist(0, k).join(' '), cb = tk.sublist(k + 1).join(' ');
+        if (const {'y', 'e', 'con', '&', 'x'}.contains(tk[k])) {
+          divisiones.add((tk.sublist(0, k).join(' '), tk.sublist(k + 1).join(' ')));
+        }
+      }
+    }
+    if (red != null) {
+      for (final (ca, cb) in divisiones) {
         for (final x in red.cruces(ca, cb, limite: 10)) {
           hayCruce = true;
           res.add(Resultado('${x.a} y ${x.b}', 'Cruce${aDist(x.lat, x.lon)}', '🔀', x.lat, x.lon));
         }
         if (hayCruce) break;
       }
-      if (buscoCruce && !hayCruce && res.isEmpty) {
-        _msg('No encontré ese cruce en la zona cargada. Mueve el mapa cerca de él (se lee ~45 km alrededor) e inténtalo otra vez.');
+    }
+    if (divisiones.isNotEmpty && !hayCruce && _indicesCalles.isNotEmpty) {
+      // Fuera de la zona cargada: en el índice de TODO el archivo se buscan tramos de ambas calles que coinciden en
+      // la misma zona (~12 km). Al elegirlo, se carga esa zona y se calcula el cruce exacto.
+      for (final (ca, cb) in divisiones) {
+        var ha = await _buscarEnIndices(ca), hb = await _buscarEnIndices(cb);
+        if (u != null) {
+          int porDist(({String nombre, double lat, double lon, bool empieza}) a, ({String nombre, double lat, double lon, bool empieza}) b) =>
+              Geo.dist(u.latitude, u.longitude, a.lat, a.lon).compareTo(Geo.dist(u.latitude, u.longitude, b.lat, b.lon));
+          ha.sort(porDist);
+          hb.sort(porDist);
+        }
+        if (ha.length > 500) ha = ha.sublist(0, 500);
+        if (hb.length > 500) hb = hb.sublist(0, 500);
+        final pares = <({String a, String b, double lat, double lon, double d})>[];
+        for (final x in ha) {
+          for (final y in hb) {
+            if (x.nombre == y.nombre) continue;
+            final dd = Geo.dist(x.lat, x.lon, y.lat, y.lon);
+            if (dd > 12000) continue;
+            final la = (x.lat + y.lat) / 2, lo = (x.lon + y.lon) / 2;
+            pares.add((a: x.nombre, b: y.nombre, lat: la, lon: lo,
+                d: u == null ? dd : Geo.dist(u.latitude, u.longitude, la, lo)));
+          }
+        }
+        pares.sort((p, q) => p.d.compareTo(q.d));
+        final vistos = <String>{};
+        for (final q in pares) {
+          if (!vistos.add('${q.a}|${q.b}|${(q.lat / 0.1).round()}|${(q.lon / 0.1).round()}')) continue;
+          _crucesAprox['${q.lat},${q.lon}'] = (q.a, q.b);
+          res.add(Resultado('${q.a} y ${q.b}', 'Cruce · zona aproximada${aDist(q.lat, q.lon)}', '🔁', q.lat, q.lon));
+          if (vistos.length >= 8) break;
+        }
+        if (vistos.isNotEmpty) break;
       }
     }
     final vistasCalle = <String>{};
@@ -4367,7 +4435,31 @@ class Controlador extends ChangeNotifier {
     return res.take(80).toList();
   }
 
-  Future<void> irAResultado(Resultado r) => establecerDestino(LatLng(r.lat, r.lon), r.titulo);
+  final Map<String, (String, String)> _crucesAprox = <String, (String, String)>{};
+
+  Future<void> irAResultado(Resultado r) async {
+    var p = LatLng(r.lat, r.lon);
+    final par = r.icono == '🔁' ? _crucesAprox['${r.lat},${r.lon}'] : null;
+    if (par != null) {
+      // Cruce fuera de la zona cargada: se carga la zona de ese lugar y se calcula el cruce exacto
+      _msg('Cargando la zona del cruce…');
+      focoMapa = p;
+      await _cargarRedGuardada(centro: p);
+      final red = motor.red;
+      if (red != null) {
+        final xs = red.cruces(Fmt.normalizar(par.$1), Fmt.normalizar(par.$2), limite: 20);
+        double mejor = 15000;
+        for (final x in xs) {
+          final dd = Geo.dist(p.latitude, p.longitude, x.lat, x.lon);
+          if (dd < mejor) {
+            mejor = dd;
+            p = LatLng(x.lat, x.lon);
+          }
+        }
+      }
+    }
+    await establecerDestino(p, r.titulo);
+  }
 
   Future<void> _irAPorNombre(String nombre) async {
     final r = await buscar(nombre);
@@ -5441,7 +5533,7 @@ class Controlador extends ChangeNotifier {
   }
 
   /// Busca [norm] en los índices de calles (todo el archivo, en flujo: casi no usa memoria).
-  Future<List<({String nombre, double lat, double lon, bool empieza})>> _buscarEnIndices(String norm) async {
+  Future<List<({String nombre, double lat, double lon, bool empieza})>> _buscarEnIndices(String norm, {int maximo = 40000}) async {
     final r = <({String nombre, double lat, double lon, bool empieza})>[];
     for (final ruta in _indicesCalles.values) {
       try {
@@ -5456,7 +5548,7 @@ class Controlador extends ChangeNotifier {
           final la = double.tryParse(partes[2]), lo = double.tryParse(partes[3]);
           if (la == null || lo == null) continue;
           r.add((nombre: partes[1], lat: la, lon: lo, empieza: k == 0));
-          if (r.length >= 600) return r;
+          if (r.length >= maximo) return r;
         }
       } catch (_) {}
     }
@@ -5597,6 +5689,7 @@ class Controlador extends ChangeNotifier {
           redEnSd = m['redEnSd'] == true;
           descargaMapaEnSd = m['descargaMapaEnSd'] == true;
           descargaRedEnSd = m['descargaRedEnSd'] == true;
+          privacidadAceptada = m['privacidadAceptada'] == true;
           motor.evitarPeajes = evitarPeajes;
           motor.evitarTerraceria = evitarTerraceria;
         }
@@ -5614,6 +5707,7 @@ class Controlador extends ChangeNotifier {
         'redEnSd': redEnSd,
         'descargaMapaEnSd': descargaMapaEnSd,
         'descargaRedEnSd': descargaRedEnSd,
+        'privacidadAceptada': privacidadAceptada,
       }));
     } catch (_) {}
   }
@@ -5883,13 +5977,125 @@ void main() {
   c.iniciar(); // abre BD, voz, mapas, red vial y GPS sin bloquear el primer frame
 }
 
+// ============================================================================
+// PRIVACIDAD Y CUMPLIMIENTO (Google Play)
+// ============================================================================
+
+const String kNombreApp = 'Navegación Offline MX';
+const String kCorreoContacto = 'TU_CORREO@ejemplo.com'; // ← cámbialo por tu correo real antes de publicar
+
+const String kAvisoPrevio = '''Antes de empezar, esto es lo que hace la app con tus datos:
+
+📍 UBICACIÓN: se usa para mostrar tu posición, calcular rutas y dar indicaciones de voz. Mientras navegas o grabas un recorrido, la app sigue usando tu ubicación con la pantalla apagada o en segundo plano y muestra una notificación permanente. Si no navegas ni grabas, el GPS se apaga al salir de la app.
+
+🎙️ MICRÓFONO: solo para los comandos de voz. El reconocimiento se hace en el teléfono, sin internet; el audio no se guarda ni se envía.
+
+📁 ARCHIVOS: para leer tus mapas (.mbtiles) y tu red vial (.geojson) de la carpeta Descargas o de la tarjeta SD, y para guardar recorridos (GPX).
+
+🔒 Tus datos (lugares, recorridos, historial) se quedan en tu teléfono. La app no tiene cuentas, no tiene publicidad ni analíticas, y no vende ni comparte tu información. Solo usa internet si TÚ pides descargar mapas o lugares.''';
+
+const String kPoliticaPrivacidad = '''POLÍTICA DE PRIVACIDAD — $kNombreApp
+Última actualización: noviembre de 2026
+
+1. Quién es el responsable
+La app es desarrollada por su autor independiente. Contacto: $kCorreoContacto
+
+2. Qué datos usa la app
+• Ubicación precisa (GPS): para mostrar tu posición, calcular rutas, dar indicaciones y grabar recorridos que tú inicias. Se procesa únicamente en tu teléfono.
+• Ubicación con la app en segundo plano: solo mientras hay una navegación activa o una grabación de recorrido en curso, con una notificación visible. Al terminar se detiene.
+• Micrófono: para comandos de voz. El reconocimiento de voz funciona sin conexión; el audio no se almacena ni se transmite.
+• Archivos: lectura de tus mapas y red vial (carpeta Descargas o tarjeta SD) y escritura de archivos GPX/diagnóstico que tú decides guardar.
+• Datos que tú creas: lugares guardados, rutas frecuentes, historial de destinos y recorridos. Se guardan en una base de datos local del teléfono.
+
+3. Qué NO hace la app
+No tiene cuentas ni registro. No incluye publicidad, ni analíticas, ni rastreadores de terceros. No envía tu ubicación, tus recorridos ni tu historial a ningún servidor. No vende ni comparte datos personales.
+
+4. Conexiones a internet
+Solo ocurren cuando tú pides descargar mapas, red vial o lugares (servicios públicos de OpenStreetMap / Overpass u otra dirección que tú indiques). Esas peticiones contienen la zona solicitada, no tu identidad. El servicio que reciba la petición puede registrar tu dirección IP según su propia política.
+
+5. Conservación y eliminación
+Tus datos permanecen en el teléfono hasta que los borres desde la app, la desinstales o borres sus datos en Ajustes de Android. Al desinstalar, se eliminan los datos internos de la app. Los archivos GPX o de diagnóstico que guardes en Descargas son tuyos y debes borrarlos tú.
+
+6. Permisos de Android
+Ubicación, servicio en primer plano de ubicación, micrófono, notificaciones, acceso a archivos (para leer tus mapas grandes) e internet. Puedes retirarlos en cualquier momento desde Ajustes de Android; algunas funciones dejarán de estar disponibles.
+
+7. Seguridad de la navegación
+Las rutas e indicaciones son una ayuda y pueden contener errores o estar desactualizadas (calles cerradas, obras, sentidos de circulación). Respeta siempre las señales y la ley de tránsito, y no manipules el teléfono mientras conduces.
+
+8. Menores
+La app no está dirigida a menores de 13 años y no recoge conscientemente datos de ellos.
+
+9. Cambios
+Si esta política cambia, se actualizará en la app y en su página de publicación.
+
+10. Tus derechos
+Como todos los datos están en tu teléfono, tú los controlas. Para cualquier duda o solicitud, escribe a $kCorreoContacto.
+
+Atribución de mapas: © colaboradores de OpenStreetMap (licencia ODbL).''';
+
+class PantallaPrivacidad extends StatelessWidget {
+  const PantallaPrivacidad({super.key});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Privacidad y avisos')),
+        body: ListView(padding: const EdgeInsets.all(16), children: [
+          const SelectableText(kPoliticaPrivacidad),
+          const SizedBox(height: 16),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.copy),
+            label: const Text('Copiar texto'),
+            onPressed: () {
+              Clipboard.setData(const ClipboardData(text: kPoliticaPrivacidad));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Texto copiado')));
+            },
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.description_outlined),
+            label: const Text('Licencias de código abierto'),
+            onPressed: () => showLicensePage(context: context, applicationName: kNombreApp),
+          ),
+        ]),
+      );
+}
+
+/// Divulgación destacada (obligatoria en Google Play antes de pedir ubicación/micrófono).
+Future<void> mostrarAvisoPrivacidad(BuildContext context, Controlador c) async {
+  await showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: const Text('Privacidad y permisos'),
+        content: const SingleChildScrollView(child: Text(kAvisoPrevio)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).push(MaterialPageRoute<void>(builder: (_) => const PantallaPrivacidad())),
+            child: const Text('Política completa'),
+          ),
+          TextButton(onPressed: () => SystemNavigator.pop(), child: const Text('No acepto')),
+          FilledButton(
+            onPressed: () async {
+              await c.aceptarPrivacidad();
+              if (ctx.mounted) Navigator.of(ctx).pop();
+            },
+            child: const Text('Acepto'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 class AppNavegacion extends StatelessWidget {
   final Controlador c;
   const AppNavegacion(this.c, {super.key});
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'Navegación Offline MX',
+        title: kNombreApp,
         debugShowCheckedModeBanner: false,
         theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFF1565C0)),
         darkTheme: ThemeData(
@@ -6049,6 +6255,22 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
     WidgetsBinding.instance.addObserver(this);
     c.addListener(_alCambiar);
     c.brujula.addListener(_alBrujula);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _revisarPrivacidad());
+  }
+
+  bool _avisoMostrado = false;
+
+  /// Espera a que se lean los ajustes y, si nunca aceptaste el aviso, lo muestra antes de pedir permisos.
+  Future<void> _revisarPrivacidad() async {
+    for (var i = 0; i < 40 && mounted && !_avisoMostrado; i++) {
+      if (c.privacidadAceptada) return;
+      if (c.ajustesLeidos) {
+        _avisoMostrado = true;
+        await mostrarAvisoPrivacidad(context, c);
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
   }
 
   @override
@@ -6395,6 +6617,7 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
               ),
             ),
         ]),
+        const SimpleAttributionWidget(source: Text('© colaboradores de OpenStreetMap')), // exigido por la licencia ODbL
       ],
     );
   }
@@ -6633,6 +6856,9 @@ class _EstadoPantalla extends State<PantallaPrincipal> with WidgetsBindingObserv
                 _menu('🥾 Recorridos', () => _abrirMenu(3)),
                 _menu('📋 Coordenadas', c.copiarCoordenadas),
                 _menu('🩺 Diagnóstico', () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => PantallaDiagnostico(c)))),
+              ]),
+              Row(children: [
+                _menu('🔒 Privacidad', () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const PantallaPrivacidad()))),
               ]),
             ],
           ]),
